@@ -52,14 +52,14 @@ def readSigTokens(filename):
 
 def processLine(line):
     [num, annot] = line.split('\t')
-    [input_name, sig] = annot.split('::')
+    [input_name, sig] = annot.split('::', 1)
     input_name = input_name.strip()
     sig = sig.strip()
     return num, input_name, sig
 
 def prepareData(filename, use_context=False, num_context_sig=3):
     with open(filename, 'r') as f:
-        lines = f.read().split('\n')
+        lines = filter(lambda l: len(l) > 0, f.read().split('\n'))
     input_lang = Lang(True)
     data = []
     if use_context:
