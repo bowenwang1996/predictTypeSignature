@@ -2,14 +2,54 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.autograd import Variable
-from identifier_segmentor import segment
-from prepare_data import readSigTokens, prepareData, start_token, end_token, unk_token
-from model import Encoder, Decoder, AttnDecoder
 import time
 import math
 import random
+import argparse
+
+from identifier_segmentor import segment
+from prepare_data import readSigTokens, prepareData, start_token, end_token, unk_token, prepareDataWithFileName
+from model import Encoder, Decoder, AttnDecoder
 
 use_cuda = torch.cuda.is_available()
+parser = argparse.ArgumentParser(description="train model")
+
+parser.add_argument("--train_data", metavar="TRAIN DATA",
+                    default="data/train_simple_sigs_parsable_normalized.txt",
+                    )
+
+parser.add_argument("--dev_data", metavar="DEV DATA",
+                    default="data/dev_simple_sigs_parsable_normalized.txt",
+                    )
+
+parser.add_argument("--test_data", metavar="TEST DATA",
+                    default="data/test_simple_sigs_parsable_normalized.txt",
+                    )
+
+parser.add_argument("--type_token_data", metavar="TYPE TOKEN",
+                    default="data/simple_types_vocab.txt"
+                    )
+
+parser.add_argument("--use_qualified_name", default=0, type=int,
+                    help="0 for not using qualified name, 1 for using qualified name"
+                    )
+
+parser.add_argument("--train_data_qualified", metavar="QUALIFED TRAIN DATA",
+                    default="data/data_with_file_names/train_simple_sigs_parsable_normalized.txt")
+
+parser.add_argument("--dev_data_qualified", metavar="QUALIFED DEV DATA",
+                    default="data/data_with_file_names/dev_simple_sigs_parsable_normalized.txt")
+
+parser.add_argument("--test_data_qualified", metavar="QUALIFED TEST DATA",
+                    default="data/data_with_file_names/test_simple_sigs_parsable_normalized.txt")
+
+parser.add_argument("--encoder_state_file", default="encoder_state.pth")
+parser.add_argument("--decoder_state_file", default="decoder_state.pth")
+parser.add_argument("--batch_size", default=32, type=int)
+parser.add_argument("--eval_batch_size", default=8, type=int)
+parser.add_argument("--hidden_size", default=256, type=int)
+parser.add_argument("--grad_clip", default=4.0, type=float)
+parser.add_argument("--num_epoch", default=50, type=int)
 
 def asMinutes(s):
     m = math.floor(s/60)
@@ -42,8 +82,10 @@ def variableFromSignature(sig, lang):
     return var
 
 def indexFromName(name, lang):
-    tokens = segment(name)
-    indices = map(lambda x: lang.lookup(x), tokens)
+    tokens = []
+    for ident in name:
+        tokens += segment(ident)
+    indices = map(lambda x: lang.lookup(x.lower()), tokens)
     indices.append(end_token)
     return indices
 
@@ -229,41 +271,43 @@ def randomEval(data, encoder, decoder, input_lang, output_lang):
     print(sig)
     print(predict_sig)
 
-def main():
-    type_token_file = "simple_types_vocab.txt"
-    train_file = "train_simple_sigs_parsable_normalized.txt"
-    dev_file = "dev_simple_sigs_parsable_normalized.txt"
+def main(arg):
+    '''
+    type_token_file = "data/simple_types_vocab.txt"
+    train_file = "data/train_simple_sigs_parsable_normalized.txt"
+    dev_file = "data/dev_simple_sigs_parsable_normalized.txt"
 
     batch_size = 32
     eval_batch_size = 8
+    '''
+    if arg.use_qualified_name == 1:
+        input_lang, train_data = prepareDataWithFileName(arg.train_data_qualified)
+        _, original_dev_data = prepareDataWithFileName(arg.dev_data_qualified)
+        _, test_data = prepareDataWithFileName(arg.test_data_qualified)
+    else:
+        input_lang, train_data = prepareData(arg.train_data)
+        _, original_dev_data = prepareData(arg.dev_data)
+        _, test_data = prepareData(arg.test_data)
+    output_lang = readSigTokens(arg.type_token_data)
+    train_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(train_data, arg.batch_size))
+    dev_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(original_dev_data, arg.eval_batch_size))
 
-    input_lang, train_data = prepareData(train_file)
-    output_lang = readSigTokens(type_token_file)
-    _, original_dev_data = prepareData(dev_file)
-    train_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(train_data, batch_size))
-    dev_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(original_dev_data, eval_batch_size))
-
-    encoder_state_file = "encoder_state.pth"
-    decoder_state_file = "decoder_state.pth"
-
-    hidden_size = 256
-    encoder = Encoder(input_lang.n_word, hidden_size)
-    decoder = AttnDecoder(output_lang.n_word, hidden_size)
+    encoder = Encoder(input_lang.n_word, arg.hidden_size)
+    decoder = AttnDecoder(output_lang.n_word, arg.hidden_size)
     if use_cuda:
         encoder = encoder.cuda()
         decoder = decoder.cuda()
     encoder_optimizer = optim.Adam(encoder.parameters(), lr=2e-4)
     decoder_optimizer = optim.Adam(decoder.parameters(), lr=2e-4)
     criterion = nn.NLLLoss(reduce=False)
-    num_epoch = 50
     
     best_accuracy = 0
     best_model = (encoder.state_dict(), decoder.state_dict())
     print("Start training...")
-    for epoch in range(num_epoch):
+    for epoch in range(arg.num_epoch):
         try:
             epoch_loss = 0
-            print("epoch {}/{}".format(epoch+1, num_epoch))
+            print("epoch {}/{}".format(epoch+1, arg.num_epoch))
             '''
             for i, pair in enumerate(train_data):
                 input_variable, input_lengths, output_variable, output_lengths = pair
@@ -288,21 +332,20 @@ def main():
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
                 best_model = (encoder.state_dict(), decoder.state_dict())
-                torch.save(best_model[0], encoder_state_file)
-                torch.save(best_model[1], decoder_state_file)
+                torch.save(best_model[0], arg.encoder_state_file)
+                torch.save(best_model[1], arg.decoder_state_file)
         except KeyboardInterrupt:
           print("Keyboard Interruption.")
           break
     print("best accuracy: {:.4f}".format(best_accuracy))
     print("Start testing...")
-    test_file = "test_simple_sigs_parsable_normalized.txt"
-    _, test_data = prepareData(test_file)
-    test_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(test_data, eval_batch_size))
-    encoder.load_state_dict(torch.load(encoder_state_file))
-    decoder.load_state_dict(torch.load(decoder_state_file))
+    test_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(test_data, arg.eval_batch_size))
+    encoder.load_state_dict(torch.load(arg.encoder_state_file))
+    decoder.load_state_dict(torch.load(arg.decoder_state_file))
     test_accuracy = eval_test(test_data, encoder, decoder)
     print("test accuracy: {:.4f}".format(test_accuracy))
     
 if __name__ == "__main__":
-    main()
+    arg = parser.parse_args()
+    main(arg)
     
