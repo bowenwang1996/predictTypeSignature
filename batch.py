@@ -63,7 +63,7 @@ class Batch():
                 token = x
             return self.target_vocab.lookup(token)
         indices = map(foo, tokens)
-        indices.append(end_token)
+        #indices.append(end_token)
         return indices
 
     def variableFromSignature(self, sig):
@@ -89,7 +89,8 @@ class Batch():
                 oov_idx_dict[token] = self.target_vocab.n_word + l
                 idx_oov_dict[self.target_vocab.n_word+l] = token
                 indices.append(oov_idx_dict[token])
-        indices.append(end_token)
+        if not indices:
+            indices.append(start_token)
         return indices
 
     def variableFromSignatures(self, sigs, oov_idx_dict, idx_oov_dict):

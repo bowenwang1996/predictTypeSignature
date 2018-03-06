@@ -48,7 +48,7 @@ class Lang:
     # remove tokens that have frequency below a certain threshold
     def trim_tokens(self, threshold=5):
         for token in self.token_to_count.keys():
-            if self.token_to_count[token] < threshold and self.token_to_idx[token] > 2 and token not in SPECIAL_SYMBOLS and random.random() < 0.1:
+            if self.token_to_count[token] < threshold and self.token_to_idx[token] > 2:
                 self.idx_to_token.pop(self.token_to_idx[token])
                 self.token_to_idx.pop(token)
                 self.token_to_count.pop(token)

@@ -12,12 +12,12 @@ use_cuda = torch.cuda.is_available()
 #use_cuda = False
 
 class Encoder(nn.Module):
-    def __init__(self, input_size, hidden_size, n_layers=1, dropout_p=0.0):
+    def __init__(self, input_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
         super(Encoder, self).__init__()
         self.n_layers = n_layers
         self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(input_size, hidden_size)
-        self.lstm = nn.LSTM(hidden_size, hidden_size/2, num_layers=n_layers, batch_first=True, dropout=dropout_p, bidirectional=True)
+        self.embedding = nn.Embedding(input_size, embed_size)
+        self.lstm = nn.LSTM(embed_size, hidden_size/2, num_layers=n_layers, batch_first=True, dropout=dropout_p, bidirectional=True)
 
     '''
     input: B * T, sorted in decreasing length
@@ -39,8 +39,8 @@ class Encoder(nn.Module):
         return hidden
 
 class ContextEncoder(Encoder):
-    def __init__(self, input_size, hidden_size, n_layers=1, dropout_p=0.0):
-        super(ContextEncoder, self).__init__(input_size, hidden_size, n_layers, dropout_p)
+    def __init__(self, input_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
+        super(ContextEncoder, self).__init__(input_size, embed_size, hidden_size, n_layers, dropout_p)
     def forward(self, input, lengths, sort_index, inv_sort_index, hidden):
         batch_size = input.size(0)
         input_len = input.size(1)
@@ -51,12 +51,12 @@ class ContextEncoder(Encoder):
         return output[inv_sort_index], hidden
     
 class Decoder(nn.Module):
-    def __init__(self, output_size, hidden_size, n_layers=1):
+    def __init__(self, output_size, embed_size, hidden_size, n_layers=1):
         super(Decoder, self).__init__()
         self.n_layers = n_layers
         self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.rnn = nn.LSTM(hidden_size, hidden_size)
+        self.embedding = nn.Embedding(output_size, embed_size)
+        self.rnn = nn.LSTM(embed_size, hidden_size)
         self.out = nn.Linear(hidden_size, output_size)
 
     def forward(self, input, hidden):
@@ -69,12 +69,12 @@ class Decoder(nn.Module):
         return output, hidden
 
 class AttnDecoder(nn.Module):
-    def __init__(self, output_size, hidden_size, n_layers=1, dropout_p=0.0):
+    def __init__(self, output_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
         super(AttnDecoder, self).__init__()
         self.n_layers = n_layers
         self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.lstm = nn.LSTM(hidden_size, hidden_size, batch_first=True, num_layers=n_layers)
+        self.embedding = nn.Embedding(output_size, embed_size)
+        self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=True, num_layers=n_layers)
         self.dropout_p = dropout_p
         self.dropout = nn.Dropout(dropout_p)
         #self.attn = nn.Linear(hidden_size, hidden_size)
@@ -151,19 +151,19 @@ class SigmoidBias(nn.Module):
         return output
     
 class ContextAttnDecoder(nn.Module):
-    def __init__(self, vocab_size, hidden_size, n_layers=1, dropout_p=0.0, max_oov=50):
+    def __init__(self, vocab_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0, max_oov=50):
         super(ContextAttnDecoder, self).__init__()
         self.n_layers = n_layers
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.max_oov = max_oov
-        self.embedding = nn.Embedding(vocab_size, hidden_size)
-        self.rnn = nn.LSTM(hidden_size, hidden_size, batch_first=True, num_layers=n_layers)
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.rnn = nn.LSTM(embed_size, hidden_size, batch_first=True, num_layers=n_layers)
         self.attn = Attn(hidden_size)
         self.context_attn = Attn(hidden_size)
-        self.gen_prob = nn.Linear(3 * hidden_size, 1)
-        #self.sigmoid = SigmoidBias(1)
-        self.sigmoid = nn.Sigmoid()
+        self.gen_prob = nn.Linear(2 * hidden_size + embed_size, 1)
+        self.sigmoid = SigmoidBias(1)
+        #self.sigmoid = nn.Sigmoid()
         self.dropout_p = dropout_p
         self.dropout = nn.Dropout(dropout_p)
         self.out = nn.Linear(hidden_size, vocab_size)
@@ -177,7 +177,10 @@ class ContextAttnDecoder(nn.Module):
         output, hidden = self.rnn(embedded, hidden)
         context = self.attn(output, encoder_outputs, context_only=True)
         p_gen = self.sigmoid(self.gen_prob(torch.cat((context, output.view(batch_size, -1), embedded.view(batch_size, -1)), 1)))
+        context_length = (context_input > 0).long().sum(1).unsqueeze(1)
+        p_gen.masked_fill_(context_length == 0, 1)
         context_attn_scores = self.context_attn(output, context_encoder_outputs, score_only=True)
+
         p_vocab = F.softmax(self.out(output.squeeze(1)), dim=1) # B * O
         oov_var = Variable(torch.zeros(batch_size, self.max_oov))
         if use_cuda:

@@ -52,8 +52,9 @@ parser.add_argument("--decoder_state_file", default="decoder_state.pth")
 parser.add_argument("--batch_size", default=32, type=int)
 parser.add_argument("--eval_batch_size", default=8, type=int)
 parser.add_argument("--hidden_size", default=256, type=int)
+parser.add_argument("--embed_size", default=128, type=int)
 parser.add_argument("--grad_clip", default=4.0, type=float)
-parser.add_argument("--num_epoch", default=50, type=int)
+parser.add_argument("--num_epoch", default=30, type=int)
 parser.add_argument("--dump_result", default=0, type=int)
 parser.add_argument("--dev_result", default="results/dev_result.csv")
 parser.add_argument("--test_results", default="results/test_result.csv")
@@ -138,7 +139,15 @@ def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer,
     '''
     decoder_hidden = (encoder_hidden[0].view(1, batch_size, -1) + context_encoder_hidden[0].view(1, batch_size, -1),
                       encoder_hidden[1].view(1, batch_size, -1) + context_encoder_hidden[1].view(1, batch_size, -1))
-
+    '''
+    decoder_hidden = (torch.cat((encoder_hidden[0].view(1, batch_size, -1),
+                                 context_encoder_hidden[0].view(1, batch_size, -1)),
+                                2),
+                      torch.cat((encoder_hidden[1].view(1, batch_size, -1),
+                                 context_encoder_hidden[0].view(1, batch_size, -1)),
+                                2)
+                      )
+    '''
     loss = 0.0
     decoder_input = Variable(torch.LongTensor(batch_size, 1).fill_(start_token))
     length_tensor = torch.LongTensor(trainInfo.target_lengths)
@@ -207,7 +216,15 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
     '''
     decoder_hidden = (encoder_hidden[0].view(1, batch_size, -1) + context_encoder_hidden[0].view(1, batch_size, -1),
                       encoder_hidden[1].view(1, batch_size, -1) + context_encoder_hidden[1].view(1, batch_size, -1))
-    
+    '''
+    decoder_hidden = (torch.cat((encoder_hidden[0].view(1, batch_size, -1),
+                                 context_encoder_hidden[0].view(1, batch_size, -1)),
+                                2),
+                      torch.cat((encoder_hidden[1].view(1, batch_size, -1),
+                                 context_encoder_hidden[0].view(1, batch_size, -1)),
+                                2)
+                      )
+    '''
     decoder_in = Variable(torch.LongTensor(batch_size, 1).fill_(start_token))
     # -1 for not taken
     decoded_tokens = torch.LongTensor(batch_size, max_length).fill_(-1)
@@ -300,8 +317,8 @@ def main(arg):
         _, _, dev_data = prepareData(arg.dev_data)
         _, _, test_data = prepareData(arg.test_data)
 
-    #input_lang.trim_tokens()
-    #output_lang.trim_tokens(threshold=2)
+    
+    output_lang.trim_tokens(threshold=2)
     print("Input vocab size: {}".format(input_lang.n_word))
     print("Target vocab size: {}".format(output_lang.n_word))
 
@@ -309,19 +326,26 @@ def main(arg):
 
     train_data = map(lambda p: batch_object.variableFromBatch(p), batch_object.batchify(train_data))
 
-    encoder = Encoder(input_lang.n_word, arg.hidden_size)
-    context_encoder = ContextEncoder(output_lang.n_word, arg.hidden_size)
-    decoder = ContextAttnDecoder(output_lang.n_word, arg.hidden_size)
+    encoder = Encoder(input_lang.n_word, arg.embed_size, arg.hidden_size)
+    context_encoder = ContextEncoder(output_lang.n_word, arg.embed_size, arg.hidden_size)
+    decoder = ContextAttnDecoder(output_lang.n_word, arg.embed_size, arg.hidden_size)
     if use_cuda:
         encoder = encoder.cuda()
         context_encoder = context_encoder.cuda()
         decoder = decoder.cuda()
-    encoder_optimizer = optim.Adam(encoder.parameters(), lr=2e-4)
-    context_optimizer = optim.Adam(context_encoder.parameters(), lr=2e-4)
-    decoder_optimizer = optim.Adam(decoder.parameters(), lr=2e-4)
+    learning_rate = 3e-4
+    encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
+    context_optimizer = optim.Adam(context_encoder.parameters(), lr=learning_rate)
+    decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
+
+    encoder_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(encoder_optimizer, patience=1, verbose=True, factor=0.5)
+    context_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(context_optimizer, patience=1, verbose=True, factor=0.5)
+    decoder_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(decoder_optimizer, patience=1, verbose=True, factor=0.5)
+
     criterion = nn.NLLLoss(reduce=False)
     
     best_accuracy = 0
+    best_loss = float('inf')
     best_model = (encoder.state_dict(), context_encoder.state_dict(), decoder.state_dict())
     print("Start training...")
     for epoch in range(arg.num_epoch):
@@ -332,6 +356,11 @@ def main(arg):
             print("train loss: {:.4f}".format(epoch_loss))
             dev_loss, accuracy = eval(dev_data, batch_object, encoder, context_encoder, decoder, criterion)
             print("dev loss: {:.4f} accuracy: {:.4f}".format(dev_loss, accuracy))
+
+            encoder_optimizer_scheduler.step(dev_loss)
+            context_optimizer_scheduler.step(dev_loss)
+            decoder_optimizer_scheduler.step(dev_loss)
+
             randomEval(dev_data, batch_object, encoder, context_encoder, decoder)
             
             if accuracy > best_accuracy:
@@ -347,6 +376,7 @@ def main(arg):
     print("best accuracy: {:.4f}".format(best_accuracy))
     print("Start testing...")
     encoder.load_state_dict(torch.load(arg.encoder_state_file))
+    context_encoder.load_state_dict(torch.load(arg.context_encoder_state_file))
     decoder.load_state_dict(torch.load(arg.decoder_state_file))
     test_accuracy = eval_test(test_data, batch_object, encoder, context_encoder, decoder)
     print("test accuracy: {:.4f}".format(test_accuracy))
