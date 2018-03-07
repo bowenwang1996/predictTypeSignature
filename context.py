@@ -245,9 +245,12 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
     return decoded_tokens, eos_tensor
 
 def train(data, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion):
+    random.shuffle(data)
+    data = batch.batchify(data)
     epoch_loss = 0.0
     start = time.time()
-    for i, trainInfo in enumerate(data):
+    for i, data_batch in enumerate(data):
+        trainInfo = batch.variableFromBatch(data_batch)
         epoch_loss += train_step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion)
         if (i+1) % 1000 == 0:
             print("checkpoint{} avg loss: {:.4f}".format((i+1)/1000, epoch_loss/(i+1)))
@@ -324,7 +327,7 @@ def main(arg):
 
     batch_object = Batch(arg.batch_size, input_lang, output_lang, use_context=use_context)
 
-    train_data = map(lambda p: batch_object.variableFromBatch(p), batch_object.batchify(train_data))
+    #train_data = map(lambda p: batch_object.variableFromBatch(p), batch_object.batchify(train_data))
 
     encoder = Encoder(input_lang.n_word, arg.embed_size, arg.hidden_size)
     context_encoder = ContextEncoder(output_lang.n_word, arg.embed_size, arg.hidden_size)
@@ -338,9 +341,9 @@ def main(arg):
     context_optimizer = optim.Adam(context_encoder.parameters(), lr=learning_rate)
     decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
 
-    encoder_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(encoder_optimizer, patience=1, verbose=True, factor=0.5)
-    context_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(context_optimizer, patience=1, verbose=True, factor=0.5)
-    decoder_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(decoder_optimizer, patience=1, verbose=True, factor=0.5)
+    encoder_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(encoder_optimizer, patience=3, verbose=True, factor=0.5)
+    context_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(context_optimizer, patience=3, verbose=True, factor=0.5)
+    decoder_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(decoder_optimizer, patience=3, verbose=True, factor=0.5)
 
     criterion = nn.NLLLoss(reduce=False)
     

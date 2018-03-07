@@ -63,7 +63,7 @@ class Batch():
                 token = x
             return self.target_vocab.lookup(token)
         indices = map(foo, tokens)
-        #indices.append(end_token)
+        indices.append(end_token)
         return indices
 
     def variableFromSignature(self, sig):
