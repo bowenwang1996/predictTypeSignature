@@ -44,7 +44,7 @@ class Batch():
         for ident in name:
             tokens += identifier_segmentor.segment(ident)
         indices = map(lambda x: self.input_vocab.lookup(x.lower()), tokens)
-        indices.append(end_token)
+        #indices.append(end_token)
         return indices
 
     def variableFromName(self, name):
@@ -77,18 +77,21 @@ class Batch():
     def indexFromSignatures(self, sigs, oov_idx_dict, idx_oov_dict):
         tokens = sum(map(lambda x: x.split(), sigs), [])
         indices = []
-        for token in tokens:
-            if token[0].isupper():
-                token = token.split(".")[-1]
-            if token in self.target_vocab.token_to_idx:
-                indices.append(self.target_vocab.token_to_idx[token])
-            elif token in oov_idx_dict:
-                indices.append(oov_idx_dict[token])
-            else:
-                l = len(oov_idx_dict)
-                oov_idx_dict[token] = self.target_vocab.n_word + l
-                idx_oov_dict[self.target_vocab.n_word+l] = token
-                indices.append(oov_idx_dict[token])
+        for sig in sigs:
+            tokens = sig.split()
+            for token in tokens:
+                if token[0].isupper():
+                    token = token.split(".")[-1]
+                if token in self.target_vocab.token_to_idx:
+                    indices.append(self.target_vocab.token_to_idx[token])
+                elif token in oov_idx_dict:
+                    indices.append(oov_idx_dict[token])
+                else:
+                    l = len(oov_idx_dict)
+                    oov_idx_dict[token] = self.target_vocab.n_word + l
+                    idx_oov_dict[self.target_vocab.n_word+l] = token
+                    indices.append(oov_idx_dict[token])
+            #indices.append(end_token)
         if not indices:
             indices.append(start_token)
         return indices

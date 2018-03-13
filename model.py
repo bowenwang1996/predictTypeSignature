@@ -138,16 +138,14 @@ class Attn(nn.Module):
 
 # according to https://discuss.pytorch.org/t/does-nn-sigmoid-have-bias-parameter/10561/2
 class SigmoidBias(nn.Module):
-    def __init__(self, output_size, bias=True):
+    def __init__(self, output_size):
         super(SigmoidBias, self).__init__()
-        if bias:
-            self.bias = nn.Parameter(torch.Tensor(output_size))
-            self.bias.data.uniform_(-0.1, 0.1)
+        self.bias = nn.Parameter(torch.Tensor(output_size))
+        self.bias.data.uniform_(-0.1, 0.1)
 
     def forward(self, input):
-        output = F.sigmoid(input)
-        if self.bias is not None:
-            output = output + self.bias.unsqueeze(0).expand_as(output)
+        output = input + self.bias.unsqueeze(0).expand_as(input)
+        output = F.sigmoid(output)
         return output
     
 class ContextAttnDecoder(nn.Module):
@@ -179,11 +177,11 @@ class ContextAttnDecoder(nn.Module):
         context_attn_scores = self.context_attn(output, context_encoder_outputs, score_only=True)
         context_context = torch.bmm(context_attn_scores.unsqueeze(1), context_encoder_outputs).squeeze(1)
         p_gen = self.sigmoid(self.gen_prob(torch.cat((context, context_context, output.view(batch_size, -1), embedded.view(batch_size, -1)), 1)))
+        new_p_gen = p_gen.clone()
 
         context_length = (context_input > 0).long().sum(1).unsqueeze(1)
-        p_gen.masked_fill_(context_length == 0, 1)
-
-
+        new_p_gen.masked_fill_(context_length == 0, 1)
+        p_gen = new_p_gen
 
         p_vocab = F.softmax(self.out(output.squeeze(1)), dim=1) # B * O
         oov_var = Variable(torch.zeros(batch_size, self.max_oov))
@@ -191,35 +189,15 @@ class ContextAttnDecoder(nn.Module):
             oov_var = oov_var.cuda()
         p_vocab = torch.cat((p_vocab, oov_var), 1)
 
-        '''
-        numbers = context_input.view(-1).data.tolist()
-        counter = Counter(numbers)
-        dup_list = [k for k in counter if counter[k] > 1]
-        masked_idx_sum = Variable(torch.zeros(batch_size, context_input_len))
-        dup_attn_sum = Variable(torch.zeros(batch_size, context_input_len))
-        if use_cuda:
-            masked_idx_sum = masked_idx_sum.cuda()
-            dup_attn_sum = dup_attn_sum.cuda()
-        
-        for dup in dup_list:
-            mask = (context_input == dup).float()
-            masked_idx_sum += mask
-            attn_mask = mask * context_attn_scores
-            attn_sum = attn_mask.sum(1).unsqueeze(1)
-            dup_attn_sum += attn_sum * mask
-        '''
-        
-        #context_attn_scores = context_attn_scores * (1 - masked_idx_sum) + dup_attn_sum
         batch_indices = torch.arange(start=0, end=batch_size).long()
         batch_indices = batch_indices.expand(context_input_len, batch_size).transpose(1, 0).contiguous().view(-1)
-        #idx_repeat = torch.arange(start=0, end=context_input_len).repeat(batch_size).long()
+
         p_copy = Variable(torch.zeros(batch_size, self.vocab_size + self.max_oov))
         if use_cuda:
             p_copy = p_copy.cuda()
             batch_indices = batch_indices.cuda()
         word_indices = context_input.view(-1)
         linearized_indices = Variable(batch_indices) * (self.vocab_size + self.max_oov) + word_indices
-        #value_to_add = context_attn_scores[batch_indices, idx_repeat].view(-1)
         value_to_add = context_attn_scores.view(-1)
         p_copy.put_(linearized_indices, value_to_add, accumulate=True)
         output_prob = p_gen * p_vocab + (1 - p_gen) * p_copy

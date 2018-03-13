@@ -245,7 +245,6 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
     return decoded_tokens, eos_tensor
 
 def train(data, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion):
-    random.shuffle(data)
     data = batch.batchify(data)
     epoch_loss = 0.0
     start = time.time()
