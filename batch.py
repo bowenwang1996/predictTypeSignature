@@ -17,10 +17,6 @@ class TrainInfo():
         self.input_lengths = input_lengths
         self.target_variable = target_var
         self.target_lengths = target_lengths
-        self.context_variable = context_var
-        self.context_lengths = sorted(context_lengths, reverse=True)
-        self.context_sort_index = get_sort_index(context_lengths)
-        self.context_inv_index = inv(self.context_sort_index)
         self.oov_idx_dict = oov_idx_dict
         self.idx_oov_dict = idx_oov_dict
 
@@ -74,10 +70,10 @@ class Batch():
         return sig_var
 
     # unlike the method above, this method needs to take into account of oov words
-    def indexFromSignatures(self, sigs, oov_idx_dict, idx_oov_dict):
-        tokens = sum(map(lambda x: x.split(), sigs), [])
+    def indexFromSignatures(self, context, oov_idx_dict, idx_oov_dict):
         indices = []
-        for sig in sigs:
+        for name, sig in context:
+            indices += self.indexFromName(name)
             tokens = sig.split()
             for token in tokens:
                 if token[0].isupper():
@@ -92,8 +88,6 @@ class Batch():
                     idx_oov_dict[self.target_vocab.n_word+l] = token
                     indices.append(oov_idx_dict[token])
             #indices.append(end_token)
-        if not indices:
-            indices.append(start_token)
         return indices
 
     def variableFromSignatures(self, sigs, oov_idx_dict, idx_oov_dict):
@@ -104,8 +98,12 @@ class Batch():
         return var
     
     def variableFromBatch(self, batch):
-        input_target_batch = map(lambda p: (self.indexFromName(p[0]), self.indexFromSignature(p[1])), batch)
-        input_sort_index = get_sort_index(map(lambda p: len(p[0]), input_target_batch))
+        oov_idx_dict = {}
+        idx_oov_dict = {}
+        input_target_batch = map(lambda p:
+                                 (self.indexFromSignatures(p[2], oov_idx_dict, idx_oov_dict) + self.indexFromName(p[0]),
+                                  self.indexFromSignature(p[1])),
+                                 batch)
         input_target_batch = sorted(input_target_batch, key=lambda p:len(p[0]), reverse=True)
         input_lengths = map(lambda p: len(p[0]), input_target_batch)
         target_lengths = map(lambda p: len(p[1]), input_target_batch)
@@ -122,24 +120,6 @@ class Batch():
         if use_cuda:
             input_variable = input_variable.cuda()
             target_variable = target_variable.cuda()
-            
-        if self.use_context:
-            oov_idx_dict = {}
-            idx_oov_dict = {}
-            context_batch = []
-            for x in batch:
-                indices = self.indexFromSignatures(x[2], oov_idx_dict, idx_oov_dict)
-                context_batch.append(indices)
-
-            context_lengths = map(len, context_batch)
-            max_context_len = max(context_lengths)
-            context_batch = pad_to_len(context_batch, max_context_len)
-            context_variable = Variable(torch.LongTensor(context_batch))
-            if use_cuda:
-                context_variable = context_variable.cuda()
-            context_variable = context_variable[input_sort_index]
-            context_lengths = [context_lengths[i] for i in input_sort_index]
-            return TrainInfo(input_variable, input_lengths, target_variable, target_lengths, context_variable, context_lengths, oov_idx_dict, idx_oov_dict)
         return TrainInfo(input_variable, input_lengths, target_variable, target_lengths, None, None, None, None)
 
     def unk_batch(self, batch):

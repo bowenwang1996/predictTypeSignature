@@ -31,13 +31,28 @@ class Lang:
             self.add_token(token.lower())
 
     def add_sig(self, sig):
-        assert(not self.is_input)
+        #assert(not self.is_input)
         # if it is a typename, we only need the unqualified part
         for token in sig.split():
             if token[0].isalpha():
                 self.add_token(token.split('.')[-1])
             else:
                 self.add_token(token)
+
+    def merge_output(self, output_lang):
+        assert(self.is_input)
+        token_to_idx = {}
+        idx_to_token = {0: "<TYPE>", 1: "</TYPE>", 2: "<UNK>"}
+        for token in output_lang.token_to_idx:
+            token_to_idx[token] = output_lang.token_to_idx[token]
+            idx_to_token[output_lang.token_to_idx[token]] = token
+        for token in self.token_to_idx:
+            if token not in token_to_idx:
+                token_to_idx[token] = output_lang.n_word - 3 + self.token_to_idx[token]
+                idx_to_token[output_lang.n_word - 3 + self.token_to_idx[token]] = token
+                self.n_word += 1
+        self.token_to_idx = token_to_idx
+        self.idx_to_token = idx_to_token
             
     def lookup(self, token):
         if token in self.token_to_idx:
@@ -48,7 +63,7 @@ class Lang:
     # remove tokens that have frequency below a certain threshold
     def trim_tokens(self, threshold=5):
         for token in self.token_to_count.keys():
-            if self.token_to_count[token] < threshold and self.token_to_idx[token] > 2:
+            if self.token_to_count[token] < threshold and self.token_to_idx[token] > 2 and random.random() < 0.5:
                 self.idx_to_token.pop(self.token_to_idx[token])
                 self.token_to_idx.pop(token)
                 self.token_to_count.pop(token)
@@ -138,13 +153,14 @@ def prepareDataWithFileName(filename, full_path=False, use_context=False, num_co
         for line in lines:
             num, fname, input_name, sig = processLineWithFileName(line, full_path)
             cur_context = context_sigs[-num_context_sig:]
-            sigs = [ p[1] for p in cur_context if p[0] == num]
+            context = [ (p[1], p[2]) for p in cur_context if p[0] == num]
             name = fname + [input_name]
-            data.append((name, sig, sigs))
-            context_sigs.append([num, sig])
+            data.append((name, sig, context))
+            context_sigs.append([num, name, sig])
             for ident in name:
                 input_lang.add_name(ident)
             output_lang.add_sig(sig)
+        input_lang.merge_output(output_lang)
     else:
         for line in lines:
             _, fname, input_name, sig = processLineWithFileName(line, full_path)

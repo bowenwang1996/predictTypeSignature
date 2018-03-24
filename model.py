@@ -159,7 +159,7 @@ class ContextAttnDecoder(nn.Module):
         self.rnn = nn.LSTM(embed_size, hidden_size, batch_first=True, num_layers=n_layers)
         self.attn = Attn(hidden_size)
         self.context_attn = Attn(hidden_size)
-        self.gen_prob = nn.Linear(3 * hidden_size + embed_size, 1)
+        self.gen_prob = nn.Linear(2 * hidden_size + embed_size, 1)
         self.sigmoid = SigmoidBias(1)
         #self.sigmoid = nn.Sigmoid()
         self.dropout_p = dropout_p
@@ -167,21 +167,14 @@ class ContextAttnDecoder(nn.Module):
         self.out = nn.Linear(hidden_size, vocab_size)
 
 
-    def forward(self, input, hidden, encoder_outputs, context_encoder_outputs, context_input):
+    def forward(self, input, hidden, encoder_outputs, encoder_input):
         batch_size = input.size(0)
         input_len = input.size(1)
-        context_input_len = context_input.size(1)
         embedded = self.embedding(input).view(batch_size, input_len, -1) # B * 1 * H
         output, hidden = self.rnn(embedded, hidden)
-        context = self.attn(output, encoder_outputs, context_only=True)
-        context_attn_scores = self.context_attn(output, context_encoder_outputs, score_only=True)
-        context_context = torch.bmm(context_attn_scores.unsqueeze(1), context_encoder_outputs).squeeze(1)
-        p_gen = self.sigmoid(self.gen_prob(torch.cat((context, context_context, output.view(batch_size, -1), embedded.view(batch_size, -1)), 1)))
-        new_p_gen = p_gen.clone()
-
-        context_length = (context_input > 0).long().sum(1).unsqueeze(1)
-        new_p_gen.masked_fill_(context_length == 0, 1)
-        p_gen = new_p_gen
+        context_attn_scores = self.attn(output, encoder_outputs, score_only=True)
+        context = torch.bmm(context_attn_scores.unsqueeze(1), encoder_outputs).squeeze(1)
+        p_gen = self.sigmoid(self.gen_prob(torch.cat((context, output.view(batch_size, -1), embedded.view(batch_size, -1)), 1)))
 
         p_vocab = F.softmax(self.out(output.squeeze(1)), dim=1) # B * O
         oov_var = Variable(torch.zeros(batch_size, self.max_oov))
@@ -189,17 +182,20 @@ class ContextAttnDecoder(nn.Module):
             oov_var = oov_var.cuda()
         p_vocab = torch.cat((p_vocab, oov_var), 1)
 
+        mask = encoder_input < self.vocab_size
         batch_indices = torch.arange(start=0, end=batch_size).long()
-        batch_indices = batch_indices.expand(context_input_len, batch_size).transpose(1, 0).contiguous().view(-1)
+        batch_indices = batch_indices.expand(encoder_input.size(1), batch_size).transpose(1, 0).contiguous()
 
         p_copy = Variable(torch.zeros(batch_size, self.vocab_size + self.max_oov))
         if use_cuda:
             p_copy = p_copy.cuda()
             batch_indices = batch_indices.cuda()
-        word_indices = context_input.view(-1)
-        linearized_indices = Variable(batch_indices) * (self.vocab_size + self.max_oov) + word_indices
-        value_to_add = context_attn_scores.view(-1)
-        p_copy.put_(linearized_indices, value_to_add, accumulate=True)
+        batch_indices = batch_indices.masked_select(mask.data)
+        word_indices = encoder_input.masked_select(mask)
+        if batch_indices.shape != ():
+            linearized_indices = Variable(batch_indices) * (self.vocab_size + self.max_oov) + word_indices
+            value_to_add = context_attn_scores.masked_select(mask)
+            p_copy.put_(linearized_indices, value_to_add, accumulate=True)
         output_prob = p_gen * p_vocab + (1 - p_gen) * p_copy
 
         return torch.log(output_prob.clamp(min=1e-10)), hidden

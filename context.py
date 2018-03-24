@@ -110,7 +110,7 @@ def variableFromBatchWithContext(batch, input_lang, output_lang):
     return TrainInfo(input_variable, input_lengths, output_variable, output_lengths, context_variable, context_lengths)
 '''
 
-def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion, is_train):
+def step(trainInfo, batch, encoder,  decoder, encoder_optimizer, decoder_optimizer, criterion, is_train):
     if is_train:
         encoder_optimizer.zero_grad()
         decoder_optimizer.zero_grad()
@@ -122,32 +122,16 @@ def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer,
         
     batch_size = batch.batch_size
     encoder_hidden = encoder.initHidden(batch_size)
-    context_encoder_hidden = context_encoder.initHidden(batch_size)
     if use_cuda:
         encoder_hidden = (encoder_hidden[0].cuda(), encoder_hidden[1].cuda())
-        context_encoder_hidden = (context_encoder_hidden[0].cuda(), context_encoder_hidden[1].cuda())
     target_len = trainInfo.target_variable.size(1)
 
-    encoder_outputs, encoder_hidden = encoder(trainInfo.input_variable,
+    encoder_outputs, encoder_hidden = encoder(batch.unk_batch(trainInfo.input_variable),
                                               trainInfo.input_lengths,
                                               encoder_hidden)
-    context_variable = batch.unk_batch(trainInfo.context_variable) # for feeding to context encoder
-    context_encoder_outputs, context_encoder_hidden = context_encoder(context_variable, trainInfo.context_lengths, trainInfo.context_sort_index, trainInfo.context_inv_index, context_encoder_hidden)
-    '''
+
     decoder_hidden = (encoder_hidden[0].view(1, batch_size, -1),
                       encoder_hidden[1].view(1, batch_size, -1))
-    '''
-    decoder_hidden = (encoder_hidden[0].view(1, batch_size, -1) + context_encoder_hidden[0].view(1, batch_size, -1),
-                      encoder_hidden[1].view(1, batch_size, -1) + context_encoder_hidden[1].view(1, batch_size, -1))
-    '''
-    decoder_hidden = (torch.cat((encoder_hidden[0].view(1, batch_size, -1),
-                                 context_encoder_hidden[0].view(1, batch_size, -1)),
-                                2),
-                      torch.cat((encoder_hidden[1].view(1, batch_size, -1),
-                                 context_encoder_hidden[0].view(1, batch_size, -1)),
-                                2)
-                      )
-    '''
     loss = 0.0
     decoder_input = Variable(torch.LongTensor(batch_size, 1).fill_(start_token))
     length_tensor = torch.LongTensor(trainInfo.target_lengths)
@@ -158,7 +142,7 @@ def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer,
         length_tensor = length_tensor.cuda()
         eos_tensor = eos_tensor.cuda()
     for i in range(target_len):
-        decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden, encoder_outputs, context_encoder_outputs, trainInfo.context_variable)
+        decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden, encoder_outputs, trainInfo.input_variable)
         cur_loss = criterion(decoder_output, trainInfo.target_variable[:, i])
         loss_mask = (length_tensor > i) & (eos_tensor == -1)
         loss_mask = Variable(loss_mask).cuda() if use_cuda else Variable(loss_mask)
@@ -178,53 +162,33 @@ def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer,
         clip = 4
         torch.nn.utils.clip_grad_norm(encoder.parameters(), clip)
         torch.nn.utils.clip_grad_norm(decoder.parameters(), clip)
-        torch.nn.utils.clip_grad_norm(context_encoder.parameters(), clip)
+
         encoder_optimizer.step()
-        context_encoder_optimizer.step()
         decoder_optimizer.step()
 
-    #print(loss.data[0]/batch_size)
     return loss.data[0]/batch_size
 
-def train_step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion):
-    return step(trainInfo, batch, encoder, context_encoder, decoder,
-                encoder_optimizer, context_encoder_optimizer, decoder_optimizer,
+def train_step(trainInfo, batch, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion):
+    return step(trainInfo, batch, encoder, decoder,
+                encoder_optimizer, decoder_optimizer,
                 criterion, True)
 
-def eval_step(trainInfo, batch, encoder, context_encoder, decoder, criterion):
-    return step(trainInfo, batch, encoder, context_encoder, decoder, None, None, None,
-                criterion, False)
+def eval_step(trainInfo, batch, encoder, decoder, criterion):
+    return step(trainInfo, batch, encoder, decoder, None, None, criterion, False)
 
-def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_length = 30):
+def generate_step(trainInfo, batch, encoder, decoder, max_length = 30):
     encoder.eval()
     decoder.eval()
 
     batch_size = trainInfo.input_variable.size(0)
     encoder_hidden = encoder.initHidden(batch_size)
-    context_encoder_hidden = context_encoder.initHidden(batch_size)
     if use_cuda:
         encoder_hidden = (encoder_hidden[0].cuda(), encoder_hidden[1].cuda())
-        context_encoder_hidden = (context_encoder_hidden[0].cuda(),
-                                  context_encoder_hidden[1].cuda())
 
-    encoder_outputs, encoder_hidden = encoder(trainInfo.input_variable, trainInfo.input_lengths, encoder_hidden)
-    context_variable = batch.unk_batch(trainInfo.context_variable)
-    context_encoder_outputs, context_encoder_hidden = context_encoder(context_variable, trainInfo.context_lengths, trainInfo.context_sort_index, trainInfo.context_inv_index, context_encoder_hidden)
-    '''
+    encoder_outputs, encoder_hidden = encoder(batch.unk_batch(trainInfo.input_variable), trainInfo.input_lengths, encoder_hidden)
+
     decoder_hidden = (encoder_hidden[0].view(1, batch_size, -1),
                       encoder_hidden[1].view(1, batch_size, -1))
-    '''
-    decoder_hidden = (encoder_hidden[0].view(1, batch_size, -1) + context_encoder_hidden[0].view(1, batch_size, -1),
-                      encoder_hidden[1].view(1, batch_size, -1) + context_encoder_hidden[1].view(1, batch_size, -1))
-    '''
-    decoder_hidden = (torch.cat((encoder_hidden[0].view(1, batch_size, -1),
-                                 context_encoder_hidden[0].view(1, batch_size, -1)),
-                                2),
-                      torch.cat((encoder_hidden[1].view(1, batch_size, -1),
-                                 context_encoder_hidden[0].view(1, batch_size, -1)),
-                                2)
-                      )
-    '''
     decoder_in = Variable(torch.LongTensor(batch_size, 1).fill_(start_token))
     # -1 for not taken
     decoded_tokens = torch.LongTensor(batch_size, max_length).fill_(-1)
@@ -234,7 +198,7 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
         decoded_tokens = decoded_tokens.cuda()
         eos_tensor = eos_tensor.cuda()
     for i in range(max_length):
-        decoder_out, decoder_hidden = decoder(decoder_in, decoder_hidden, encoder_outputs, context_encoder_outputs, trainInfo.context_variable)
+        decoder_out, decoder_hidden = decoder(decoder_in, decoder_hidden, encoder_outputs, trainInfo.input_variable)
         _, topi = decoder_out.data.topk(1, dim=1)
         pred = topi[:, 0]
         decoded_tokens[:, i] = pred
@@ -244,13 +208,13 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
         decoder_in = Variable(batch.unk_batch(topi))
     return decoded_tokens, eos_tensor
 
-def train(data, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion):
+def train(data, batch, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion):
     data = batch.batchify(data)
     epoch_loss = 0.0
     start = time.time()
     for i, data_batch in enumerate(data):
         trainInfo = batch.variableFromBatch(data_batch)
-        epoch_loss += train_step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion)
+        epoch_loss += train_step(trainInfo, batch, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion)
         if (i+1) % 1000 == 0:
             print("checkpoint{} avg loss: {:.4f}".format((i+1)/1000, epoch_loss/(i+1)))
             print("time since start: {}".format(timeSince(start)))
@@ -258,7 +222,7 @@ def train(data, batch, encoder, context_encoder, decoder, encoder_optimizer, con
     print("epoch total training time:{}".format(timeSince(start)))
     return epoch_loss
 
-def eval(data, batch_object, encoder, context_encoder, decoder, criterion, is_test=False):
+def eval(data, batch_object, encoder, decoder, criterion, is_test=False):
     data = batch_object.batchify(data)
     num_correct = 0
     loss = 0
@@ -266,22 +230,22 @@ def eval(data, batch_object, encoder, context_encoder, decoder, criterion, is_te
     batch_size = batch_object.batch_size
     for batch in data:
         trainInfo = batch_object.variableFromBatch(batch)
-        decoded_tokens, eos_tensor = generate_step(trainInfo, batch_object, encoder, context_encoder, decoder)
-        batch = sorted(batch, key=lambda p: len(batch_object.indexFromName(p[0])), reverse=True)
+        decoded_tokens, eos_tensor = generate_step(trainInfo, batch_object, encoder, decoder)
+        batch = sorted(batch, key=lambda p: len(batch_object.indexFromSignatures(p[2], {}, {}) + batch_object.indexFromName(p[0])), reverse=True)
         for i in range(batch_size):
             _, sig, _ = batch[i]
             predict_sig = tokensToString(decoded_tokens[i, :eos_tensor[i]].tolist(), batch_object.target_vocab, trainInfo.idx_oov_dict)
             if predict_sig == process_sig(sig):
                 num_correct += 1
         if not is_test:
-            loss += eval_step(trainInfo, batch_object, encoder, context_encoder, decoder, criterion)
+            loss += eval_step(trainInfo, batch_object, encoder, decoder, criterion)
     accuracy = float(num_correct)/(data_len * batch_size)
     if is_test:
         return accuracy
     return loss/data_len, accuracy
 
-def eval_test(data, batch, encoder, context_encoder, decoder):
-    return eval(data, batch, encoder, context_encoder, decoder, None, is_test=True)
+def eval_test(data, batch, encoder, decoder):
+    return eval(data, batch, encoder, decoder, None, is_test=True)
 
 def tokensToString(tokens, lang, idx_oov_dict):
     if tokens[-1] == end_token:
@@ -297,10 +261,10 @@ def tokensToString(tokens, lang, idx_oov_dict):
     return s.rstrip()
 
 # data should be in original format (i.e. string)
-def randomEval(data, batch, encoder, context_encoder, decoder):
+def randomEval(data, batch, encoder, decoder):
     datum = random.choice(data)
     trainInfo = batch.variableFromBatch([datum])
-    decoded_tokens, eos_tensor = generate_step(trainInfo, batch, encoder, context_encoder, decoder)
+    decoded_tokens, eos_tensor = generate_step(trainInfo, batch, encoder, decoder)
     decoded_tokens = decoded_tokens.squeeze(0)[:eos_tensor[0]].tolist()
     predict_sig = tokensToString(decoded_tokens, batch.target_vocab, trainInfo.idx_oov_dict)
     print("Name:{}".format(datum[0]))
@@ -320,7 +284,7 @@ def main(arg):
         _, _, test_data = prepareData(arg.test_data)
 
     
-    output_lang.trim_tokens(threshold=2)
+    #output_lang.trim_tokens(threshold=2)
     print("Input vocab size: {}".format(input_lang.n_word))
     print("Target vocab size: {}".format(output_lang.n_word))
 
@@ -329,48 +293,42 @@ def main(arg):
     #train_data = map(lambda p: batch_object.variableFromBatch(p), batch_object.batchify(train_data))
 
     encoder = Encoder(input_lang.n_word, arg.embed_size, arg.hidden_size)
-    context_encoder = ContextEncoder(output_lang.n_word, arg.embed_size, arg.hidden_size)
     decoder = ContextAttnDecoder(output_lang.n_word, arg.embed_size, arg.hidden_size)
     if use_cuda:
         encoder = encoder.cuda()
-        context_encoder = context_encoder.cuda()
         decoder = decoder.cuda()
     learning_rate = 3e-4
     encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
-    context_optimizer = optim.Adam(context_encoder.parameters(), lr=learning_rate)
     decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
 
     encoder_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(encoder_optimizer, patience=3, verbose=True, factor=0.5)
-    context_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(context_optimizer, patience=3, verbose=True, factor=0.5)
     decoder_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(decoder_optimizer, patience=3, verbose=True, factor=0.5)
 
     criterion = nn.NLLLoss(reduce=False)
     
     best_accuracy = 0
     best_loss = float('inf')
-    best_model = (encoder.state_dict(), context_encoder.state_dict(), decoder.state_dict())
+    best_model = (encoder.state_dict(), decoder.state_dict())
     print("Start training...")
     for epoch in range(arg.num_epoch):
         try:
             epoch_loss = 0
             print("epoch {}/{}".format(epoch+1, arg.num_epoch))
-            epoch_loss = train(train_data, batch_object, encoder, context_encoder, decoder, encoder_optimizer, context_optimizer, decoder_optimizer, criterion)
+            epoch_loss = train(train_data, batch_object, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion)
             print("train loss: {:.4f}".format(epoch_loss))
-            dev_loss, accuracy = eval(dev_data, batch_object, encoder, context_encoder, decoder, criterion)
+            dev_loss, accuracy = eval(dev_data, batch_object, encoder, decoder, criterion)
             print("dev loss: {:.4f} accuracy: {:.4f}".format(dev_loss, accuracy))
 
             encoder_optimizer_scheduler.step(dev_loss)
-            context_optimizer_scheduler.step(dev_loss)
             decoder_optimizer_scheduler.step(dev_loss)
 
-            randomEval(dev_data, batch_object, encoder, context_encoder, decoder)
+            randomEval(dev_data, batch_object, encoder, decoder)
             
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
-                best_model = (encoder.state_dict(), context_encoder.state_dict(),  decoder.state_dict())
+                best_model = (encoder.state_dict(), decoder.state_dict())
                 torch.save(best_model[0], arg.encoder_state_file)
-                torch.save(best_model[1], arg.context_encoder_state_file)
-                torch.save(best_model[2], arg.decoder_state_file)
+                torch.save(best_model[1], arg.decoder_state_file)
         
         except KeyboardInterrupt:
           print("Keyboard Interruption.")
@@ -378,9 +336,8 @@ def main(arg):
     print("best accuracy: {:.4f}".format(best_accuracy))
     print("Start testing...")
     encoder.load_state_dict(torch.load(arg.encoder_state_file))
-    context_encoder.load_state_dict(torch.load(arg.context_encoder_state_file))
     decoder.load_state_dict(torch.load(arg.decoder_state_file))
-    test_accuracy = eval_test(test_data, batch_object, encoder, context_encoder, decoder)
+    test_accuracy = eval_test(test_data, batch_object, encoder, decoder)
     print("test accuracy: {:.4f}".format(test_accuracy))
 
 if __name__ == "__main__":
