@@ -10,6 +10,7 @@ from utils import *
 from prepare_data import start_token, end_token, unk_token, prepareData, readSigTokens, prepareDataWithFileName
 from model import *
 from batch import Batch, TrainInfo
+from beam import Beam
 
 use_cuda = torch.cuda.is_available()
 #use_cuda = False
@@ -58,57 +59,7 @@ parser.add_argument("--num_epoch", default=30, type=int)
 parser.add_argument("--dump_result", default=0, type=int)
 parser.add_argument("--dev_result", default="results/dev_result.csv")
 parser.add_argument("--test_results", default="results/test_result.csv")
-'''
-class TrainInfo():
-    
-    this class is purely used to hold data. I don't want to rewrite a function that has 20 arguments
-    
-    def __init__(self, input_var, input_lengths, target_var, target_lengths, context_var, context_lengths):
-        self.input_variable = input_var
-        self.input_lengths = input_lengths
-        self.target_variable = target_var
-        self.target_lengths = target_lengths
-        self.context_variable = context_var
-        self.context_lengths = context_lengths
 
-        
-def variableFromBatchWithContext(batch, input_lang, output_lang):
-    batch_size = len(batch)
-    batch = map(lambda p: (indexFromName(p[0], input_lang),
-                           indexFromSignature(p[1], output_lang),
-                           indexFromSignatures(p[2], output_lang)
-                           ),
-                batch
-                )
-    batch = sorted(batch, key=lambda p:len(p[0]), reverse=True)
-    input_lengths = map(lambda p: len(p[0]), batch)
-    output_lengths = map(lambda p: len(p[1]), batch)
-    context_lengths = map(lambda p: len(p[2]), batch)
-    max_input_len = len(batch[0][0])
-    max_output_len = max(output_lengths)
-    max_context_len = max(context_lengths)
-    batch = map(lambda p: (p[0] + (max_input_len - len(p[0])) * [0],
-                           p[1] + (max_output_len - len(p[1])) * [0],
-                           p[2] + (max_context_len - len(p[2])) * [0]
-                           ),
-                batch
-                )
-    input_batch = torch.LongTensor(batch_size, max_input_len)
-    output_batch = torch.LongTensor(batch_size, max_output_len)
-    context_batch = torch.LongTensor(batch_size, max_context_len)
-    for i in range(batch_size):
-        input_batch[i] = torch.LongTensor(batch[i][0])
-        output_batch[i] = torch.LongTensor(batch[i][1])
-        context_batch[i] = torch.LongTensor(batch[i][2])
-    input_variable = Variable(input_batch)
-    output_variable = Variable(output_batch)
-    context_variable = Variable(context_batch)
-    if use_cuda:
-        input_variable = input_variable.cuda()
-        output_variable = output_variable.cuda()
-        context_variable = context_variable.cuda()
-    return TrainInfo(input_variable, input_lengths, output_variable, output_lengths, context_variable, context_lengths)
-'''
 
 def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion, is_train):
     if is_train:
@@ -119,7 +70,7 @@ def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer,
     else:
         encoder.eval()
         decoder.eval()
-        
+
     batch_size = batch.batch_size
     encoder_hidden = encoder.initHidden(batch_size)
     context_encoder_hidden = context_encoder.initHidden(batch_size)
@@ -131,7 +82,7 @@ def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer,
     encoder_outputs, encoder_hidden = encoder(trainInfo.input_variable,
                                               trainInfo.input_lengths,
                                               encoder_hidden)
-    context_variable = batch.unk_batch(trainInfo.context_variable) # for feeding to context encoder
+    context_variable = batch.unk_batch(trainInfo.context_variable)  # for feeding to context encoder
     context_encoder_outputs, context_encoder_hidden = context_encoder(context_variable, trainInfo.context_lengths, trainInfo.context_sort_index, trainInfo.context_inv_index, context_encoder_hidden)
     '''
     decoder_hidden = (encoder_hidden[0].view(1, batch_size, -1),
@@ -197,6 +148,7 @@ def eval_step(trainInfo, batch, encoder, context_encoder, decoder, criterion):
 
 def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_length = 30):
     encoder.eval()
+    context_encoder.eval()
     decoder.eval()
 
     batch_size = trainInfo.input_variable.size(0)
@@ -225,6 +177,7 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
                                 2)
                       )
     '''
+    '''
     decoder_in = Variable(torch.LongTensor(batch_size, 1).fill_(start_token))
     # -1 for not taken
     decoded_tokens = torch.LongTensor(batch_size, max_length).fill_(-1)
@@ -233,16 +186,42 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
         decoder_in = decoder_in.cuda()
         decoded_tokens = decoded_tokens.cuda()
         eos_tensor = eos_tensor.cuda()
+    '''
+    beam_size = 5
+    beams = [ Beam(beam_size,
+                   unk_token,
+                   start_token,
+                   end_token,
+                   cuda=use_cuda)
+              for _ in range(batch_size)
+            ]
     for i in range(max_length):
-        decoder_out, decoder_hidden = decoder(decoder_in, decoder_hidden, encoder_outputs, context_encoder_outputs, trainInfo.context_variable)
-        _, topi = decoder_out.data.topk(1, dim=1)
-        pred = topi[:, 0]
-        decoded_tokens[:, i] = pred
-        decoded_tokens[:, i].masked_fill_(eos_tensor > -1, -1)
-        end_mask = pred == end_token
-        eos_tensor.masked_fill_(end_mask & (eos_tensor == -1), i+1)
-        decoder_in = Variable(batch.unk_batch(topi))
-    return decoded_tokens, eos_tensor
+        if all([b.done() for b in beams]):
+            break
+        decoder_in = torch.cat([b.get_current_state() for b in beams], 0)\
+                          .view(beam_size, -1)\
+                          .unsqueeze(2)
+        decoder_in = Variable(batch.unk_batch(decoder_in))
+        word_probs = []
+        for i in range(beam_size):
+            decoder_out, decoder_hidden = decoder(decoder_in[i],
+                                                  decoder_hidden,
+                                                  encoder_outputs,
+                                                  context_encoder_outputs,
+                                                  trainInfo.context_variable)
+            word_probs.append(decoder_out)
+        word_probs = torch.cat(word_probs, 0).data
+        for j, b in enumerate(beams):
+            b.advance(word_probs[j:j+beam_size, :])
+    decoded_tokens = []
+    for b in beams:
+        _, ks = b.sort_finished(minimum=b.n_best)
+        hyps = []
+        for i, (times, k) in enumerate(ks[:b.n_best]):
+            hyp = b.get_hyp(times, k)
+            hyps.append(hyp)
+        decoded_tokens.append(hyps[0])
+    return decoded_tokens
 
 def train(data, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion):
     data = batch.batchify(data)
@@ -266,11 +245,11 @@ def eval(data, batch_object, encoder, context_encoder, decoder, criterion, is_te
     batch_size = batch_object.batch_size
     for batch in data:
         trainInfo = batch_object.variableFromBatch(batch)
-        decoded_tokens, eos_tensor = generate_step(trainInfo, batch_object, encoder, context_encoder, decoder)
+        decoded_tokens = generate_step(trainInfo, batch_object, encoder, context_encoder, decoder)
         batch = sorted(batch, key=lambda p: len(batch_object.indexFromName(p[0])), reverse=True)
         for i in range(batch_size):
             _, sig, _ = batch[i]
-            predict_sig = tokensToString(decoded_tokens[i, :eos_tensor[i]].tolist(), batch_object.target_vocab, trainInfo.idx_oov_dict)
+            predict_sig = tokensToString(decoded_tokens[i], batch_object.target_vocab, trainInfo.idx_oov_dict)
             if predict_sig == process_sig(sig):
                 num_correct += 1
         if not is_test:
@@ -300,9 +279,9 @@ def tokensToString(tokens, lang, idx_oov_dict):
 def randomEval(data, batch, encoder, context_encoder, decoder):
     datum = random.choice(data)
     trainInfo = batch.variableFromBatch([datum])
-    decoded_tokens, eos_tensor = generate_step(trainInfo, batch, encoder, context_encoder, decoder)
-    decoded_tokens = decoded_tokens.squeeze(0)[:eos_tensor[0]].tolist()
-    predict_sig = tokensToString(decoded_tokens, batch.target_vocab, trainInfo.idx_oov_dict)
+    decoded_tokens = generate_step(trainInfo, batch, encoder, context_encoder, decoder)
+    decoded_token = decoded_tokens[0]
+    predict_sig = tokensToString(decoded_token, batch.target_vocab, trainInfo.idx_oov_dict)
     print("Name:{}".format(datum[0]))
     print("Sig:{}".format(datum[1]))
     print("Context:{}".format(datum[2]))
@@ -319,7 +298,7 @@ def main(arg):
         _, _, dev_data = prepareData(arg.dev_data)
         _, _, test_data = prepareData(arg.test_data)
 
-    
+
     output_lang.trim_tokens(threshold=2)
     print("Input vocab size: {}".format(input_lang.n_word))
     print("Target vocab size: {}".format(output_lang.n_word))
@@ -345,7 +324,7 @@ def main(arg):
     decoder_optimizer_scheduler = optim.lr_scheduler.ReduceLROnPlateau(decoder_optimizer, patience=3, verbose=True, factor=0.5)
 
     criterion = nn.NLLLoss(reduce=False)
-    
+
     best_accuracy = 0
     best_loss = float('inf')
     best_model = (encoder.state_dict(), context_encoder.state_dict(), decoder.state_dict())
@@ -353,9 +332,11 @@ def main(arg):
     for epoch in range(arg.num_epoch):
         try:
             epoch_loss = 0
+            '''
             print("epoch {}/{}".format(epoch+1, arg.num_epoch))
             epoch_loss = train(train_data, batch_object, encoder, context_encoder, decoder, encoder_optimizer, context_optimizer, decoder_optimizer, criterion)
             print("train loss: {:.4f}".format(epoch_loss))
+            '''
             dev_loss, accuracy = eval(dev_data, batch_object, encoder, context_encoder, decoder, criterion)
             print("dev loss: {:.4f} accuracy: {:.4f}".format(dev_loss, accuracy))
 
@@ -364,14 +345,14 @@ def main(arg):
             decoder_optimizer_scheduler.step(dev_loss)
 
             randomEval(dev_data, batch_object, encoder, context_encoder, decoder)
-            
+
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
                 best_model = (encoder.state_dict(), context_encoder.state_dict(),  decoder.state_dict())
                 torch.save(best_model[0], arg.encoder_state_file)
                 torch.save(best_model[1], arg.context_encoder_state_file)
                 torch.save(best_model[2], arg.decoder_state_file)
-        
+
         except KeyboardInterrupt:
           print("Keyboard Interruption.")
           break
