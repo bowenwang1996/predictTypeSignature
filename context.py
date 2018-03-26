@@ -332,11 +332,11 @@ def main(arg):
     for epoch in range(arg.num_epoch):
         try:
             epoch_loss = 0
-            '''
+
             print("epoch {}/{}".format(epoch+1, arg.num_epoch))
             epoch_loss = train(train_data, batch_object, encoder, context_encoder, decoder, encoder_optimizer, context_optimizer, decoder_optimizer, criterion)
             print("train loss: {:.4f}".format(epoch_loss))
-            '''
+
             dev_loss, accuracy = eval(dev_data, batch_object, encoder, context_encoder, decoder, criterion)
             print("dev loss: {:.4f} accuracy: {:.4f}".format(dev_loss, accuracy))
 
