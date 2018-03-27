@@ -44,7 +44,7 @@ class Batch():
         for ident in name:
             tokens += identifier_segmentor.segment(ident)
         indices = map(lambda x: self.input_vocab.lookup(x.lower()), tokens)
-        #indices.append(end_token)
+        indices.append(end_token)
         return indices
 
     def variableFromName(self, name):
@@ -91,7 +91,7 @@ class Batch():
                     oov_idx_dict[token] = self.target_vocab.n_word + l
                     idx_oov_dict[self.target_vocab.n_word+l] = token
                     indices.append(oov_idx_dict[token])
-            #indices.append(end_token)
+            indices.append(end_token)
         if not indices:
             indices.append(start_token)
         return indices
@@ -102,7 +102,7 @@ class Batch():
         if use_cuda:
             var = var.cuda()
         return var
-    
+
     def variableFromBatch(self, batch):
         input_target_batch = map(lambda p: (self.indexFromName(p[0]), self.indexFromSignature(p[1])), batch)
         input_sort_index = get_sort_index(map(lambda p: len(p[0]), input_target_batch))
@@ -113,7 +113,7 @@ class Batch():
         max_target_len = max(target_lengths)
         input_batch = map(lambda p: p[0] + (max_input_len - len(p[0])) * [0], input_target_batch)
         target_batch = map(lambda p: p[1] + (max_target_len - len(p[1])) * [0], input_target_batch)
-        
+
         input_batch = torch.LongTensor(input_batch)
         target_batch = torch.LongTensor(target_batch)
 
@@ -122,7 +122,7 @@ class Batch():
         if use_cuda:
             input_variable = input_variable.cuda()
             target_variable = target_variable.cuda()
-            
+
         if self.use_context:
             oov_idx_dict = {}
             idx_oov_dict = {}

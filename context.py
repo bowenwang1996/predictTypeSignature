@@ -189,30 +189,33 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
     '''
     beam_size = 5
     beams = [ Beam(beam_size,
-                   unk_token,
+                   start_token,
                    start_token,
                    end_token,
                    cuda=use_cuda)
               for _ in range(batch_size)
             ]
+    decoder_hiddens = [decoder_hidden for _ in range(beam_size)]
     for i in range(max_length):
         if all([b.done() for b in beams]):
             break
         decoder_in = torch.cat([b.get_current_state() for b in beams], 0)\
-                          .view(beam_size, -1)\
+                          .view(batch_size, -1)\
+                          .transpose(0, 1)\
                           .unsqueeze(2)
         decoder_in = Variable(batch.unk_batch(decoder_in))
         word_probs = []
-        for i in range(beam_size):
-            decoder_out, decoder_hidden = decoder(decoder_in[i],
-                                                  decoder_hidden,
+        for j in range(beam_size):
+            decoder_out, decoder_hidden = decoder(decoder_in[j],
+                                                  decoder_hiddens[j],
                                                   encoder_outputs,
                                                   context_encoder_outputs,
                                                   trainInfo.context_variable)
+            decoder_hiddens[j] = decoder_hidden
             word_probs.append(decoder_out)
         word_probs = torch.cat(word_probs, 0).data
         for j, b in enumerate(beams):
-            b.advance(word_probs[j:j+beam_size, :])
+            b.advance(word_probs[j:beam_size*batch_size:batch_size, :])
     decoded_tokens = []
     for b in beams:
         _, ks = b.sort_finished(minimum=b.n_best)
@@ -331,12 +334,11 @@ def main(arg):
     print("Start training...")
     for epoch in range(arg.num_epoch):
         try:
-            epoch_loss = 0
-
+            '''
             print("epoch {}/{}".format(epoch+1, arg.num_epoch))
             epoch_loss = train(train_data, batch_object, encoder, context_encoder, decoder, encoder_optimizer, context_optimizer, decoder_optimizer, criterion)
             print("train loss: {:.4f}".format(epoch_loss))
-
+            '''
             dev_loss, accuracy = eval(dev_data, batch_object, encoder, context_encoder, decoder, criterion)
             print("dev loss: {:.4f} accuracy: {:.4f}".format(dev_loss, accuracy))
 

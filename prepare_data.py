@@ -2,7 +2,7 @@ import identifier_segmentor
 from type_signatures import UNPARSE_ARROW
 import random
 
-SPECIAL_SYMBOLS = ["(", ")", "[", "]", ",", UNPARSE_ARROW, ":->", "<-->"] 
+SPECIAL_SYMBOLS = ["(", ")", "[", "]", ",", UNPARSE_ARROW, ":->", "<-->"]
 start_token = 0
 end_token = 1
 unk_token = 2
@@ -38,7 +38,7 @@ class Lang:
                 self.add_token(token.split('.')[-1])
             else:
                 self.add_token(token)
-            
+
     def lookup(self, token):
         if token in self.token_to_idx:
             return self.token_to_idx[token]
@@ -48,7 +48,9 @@ class Lang:
     # remove tokens that have frequency below a certain threshold
     def trim_tokens(self, threshold=5):
         for token in self.token_to_count.keys():
-            if self.token_to_count[token] < threshold and self.token_to_idx[token] > 2:
+            if self.token_to_count[token] < threshold\
+              and self.token_to_idx[token] > 2\
+              and random.random() < 0.5:
                 self.idx_to_token.pop(self.token_to_idx[token])
                 self.token_to_idx.pop(token)
                 self.token_to_count.pop(token)

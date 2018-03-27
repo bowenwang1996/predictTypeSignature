@@ -49,7 +49,7 @@ class ContextEncoder(Encoder):
         output, hidden = self.lstm(output, hidden)
         output, _ = pad_packed_sequence(output, batch_first=True)
         return output[inv_sort_index], hidden
-    
+
 class Decoder(nn.Module):
     def __init__(self, output_size, embed_size, hidden_size, n_layers=1):
         super(Decoder, self).__init__()
@@ -87,7 +87,7 @@ class AttnDecoder(nn.Module):
         input : B * T (T should be 1 since we use an outer loop to process target)
         encoder_outputs: B * T * H
         '''
-        
+
         input_len = input.size(1)
         batch_size = input.size(0)
         embedded = self.embedding(input).view(batch_size, input_len, -1)
@@ -105,7 +105,7 @@ class AttnDecoder(nn.Module):
         '''
         output = F.log_softmax(self.out(output), dim=1)
         return output, hidden
-        
+
     def initHidden(self, batch_size):
         hidden = (Variable(torch.zeros(1, batch_size, self.hidden_size)),
                   Variable(torch.zeros(1, batch_size, self.hidden_size))
@@ -117,7 +117,7 @@ class Attn(nn.Module):
         super(Attn, self).__init__()
         self.attn = nn.Linear(hidden_size, hidden_size)
         self.attn_combine = nn.Linear(hidden_size * 2, hidden_size)
-    
+
     def forward(self, decoder_out, encoder_outputs, score_only=False, context_only=False):
         '''
         decoder_out: B * 1 * H
@@ -147,7 +147,7 @@ class SigmoidBias(nn.Module):
         output = input + self.bias.unsqueeze(0).expand_as(input)
         output = F.sigmoid(output)
         return output
-    
+
 class ContextAttnDecoder(nn.Module):
     def __init__(self, vocab_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0, max_oov=50):
         super(ContextAttnDecoder, self).__init__()
@@ -161,7 +161,6 @@ class ContextAttnDecoder(nn.Module):
         self.context_attn = Attn(hidden_size)
         self.gen_prob = nn.Linear(3 * hidden_size + embed_size, 1)
         self.sigmoid = SigmoidBias(1)
-        #self.sigmoid = nn.Sigmoid()
         self.dropout_p = dropout_p
         self.dropout = nn.Dropout(dropout_p)
         self.out = nn.Linear(hidden_size, vocab_size)
