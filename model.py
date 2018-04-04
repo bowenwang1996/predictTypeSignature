@@ -77,8 +77,6 @@ class AttnDecoder(nn.Module):
         self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=True, num_layers=n_layers)
         self.dropout_p = dropout_p
         self.dropout = nn.Dropout(dropout_p)
-        #self.attn = nn.Linear(hidden_size, hidden_size)
-        #self.attn_combine = nn.Linear(hidden_size * 2, hidden_size)
         self.attn = Attn(hidden_size)
         self.out = nn.Linear(hidden_size, output_size)
 
@@ -132,8 +130,7 @@ class Attn(nn.Module):
         context = torch.bmm(attn_scores, encoder_outputs).squeeze(1) #B*H
         if context_only:
             return context
-        output = self.attn_combine(torch.cat((decoder_out.squeeze(1), context), 1))
-        output = F.tanh(output)
+        output = F.tanh(self.attn_combine(torch.cat((decoder_out.squeeze(1), context), 1)))
         return output
 
 # according to https://discuss.pytorch.org/t/does-nn-sigmoid-have-bias-parameter/10561/2
@@ -176,11 +173,9 @@ class ContextAttnDecoder(nn.Module):
         context_attn_scores = self.context_attn(output, context_encoder_outputs, score_only=True)
         context_context = torch.bmm(context_attn_scores.unsqueeze(1), context_encoder_outputs).squeeze(1)
         p_gen = self.sigmoid(self.gen_prob(torch.cat((context, context_context, output.view(batch_size, -1), embedded.view(batch_size, -1)), 1)))
-        new_p_gen = p_gen.clone()
 
         context_length = (context_input > 0).long().sum(1).unsqueeze(1)
-        new_p_gen.masked_fill_(context_length == 0, 1)
-        p_gen = new_p_gen
+        p_gen = p_gen.clone().masked_fill_(context_length == 0, 1)
 
         p_vocab = F.softmax(self.out(output.squeeze(1)), dim=1) # B * O
         oov_var = Variable(torch.zeros(batch_size, self.max_oov))

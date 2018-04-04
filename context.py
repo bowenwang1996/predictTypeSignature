@@ -39,13 +39,13 @@ parser.add_argument("--use_qualified_name", default=0, type=int,
 parser.add_argument("--use_full_path", default=0, type=int)
 
 parser.add_argument("--train_data_qualified", metavar="QUALIFED TRAIN DATA",
-                    default="data/data_with_file_names/train_simple_sigs_parsable_normalized.txt")
+                    default="data/new_data/train_simple_sigs_parsable_normalized.txt")
 
 parser.add_argument("--dev_data_qualified", metavar="QUALIFED DEV DATA",
-                    default="data/data_with_file_names/dev_simple_sigs_parsable_normalized.txt")
+                    default="data/new_data/dev_simple_sigs_parsable_normalized.txt")
 
 parser.add_argument("--test_data_qualified", metavar="QUALIFED TEST DATA",
-                    default="data/data_with_file_names/test_simple_sigs_parsable_normalized.txt")
+                    default="data/new_data/test_simple_sigs_parsable_normalized.txt")
 
 parser.add_argument("--encoder_state_file", default="encoder_state.pth")
 parser.add_argument("--context_encoder_state_file", default="context_encoder_state.pth")
@@ -108,8 +108,13 @@ def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer,
         decoder_input = decoder_input.cuda()
         length_tensor = length_tensor.cuda()
         eos_tensor = eos_tensor.cuda()
+
     for i in range(target_len):
-        decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden, encoder_outputs, context_encoder_outputs, trainInfo.context_variable)
+        decoder_output, decoder_hidden = decoder(decoder_input,
+                                                 decoder_hidden,
+                                                 encoder_outputs,
+                                                 context_encoder_outputs,
+                                                 trainInfo.context_variable)
         cur_loss = criterion(decoder_output, trainInfo.target_variable[:, i])
         loss_mask = (length_tensor > i) & (eos_tensor == -1)
         loss_mask = Variable(loss_mask).cuda() if use_cuda else Variable(loss_mask)
@@ -134,7 +139,6 @@ def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer,
         context_encoder_optimizer.step()
         decoder_optimizer.step()
 
-    #print(loss.data[0]/batch_size)
     return loss.data[0]/batch_size
 
 def train_step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion):
@@ -187,7 +191,7 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
         decoded_tokens = decoded_tokens.cuda()
         eos_tensor = eos_tensor.cuda()
     '''
-    beam_size = 5
+    beam_size = 1
     beams = [ Beam(beam_size,
                    start_token,
                    start_token,
@@ -227,11 +231,9 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
     return decoded_tokens
 
 def train(data, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion):
-    data = batch.batchify(data)
     epoch_loss = 0.0
     start = time.time()
-    for i, data_batch in enumerate(data):
-        trainInfo = batch.variableFromBatch(data_batch)
+    for i, trainInfo in enumerate(data):
         epoch_loss += train_step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion)
         if (i+1) % 1000 == 0:
             print("checkpoint{} avg loss: {:.4f}".format((i+1)/1000, epoch_loss/(i+1)))
@@ -302,13 +304,13 @@ def main(arg):
         _, _, test_data = prepareData(arg.test_data)
 
 
-    output_lang.trim_tokens(threshold=2)
+    #output_lang.trim_tokens(threshold=2)
     print("Input vocab size: {}".format(input_lang.n_word))
     print("Target vocab size: {}".format(output_lang.n_word))
 
     batch_object = Batch(arg.batch_size, input_lang, output_lang, use_context=use_context)
 
-    #train_data = map(lambda p: batch_object.variableFromBatch(p), batch_object.batchify(train_data))
+    train_data = map(lambda p: batch_object.variableFromBatch(p), batch_object.batchify(train_data))
 
     encoder = Encoder(input_lang.n_word, arg.embed_size, arg.hidden_size)
     context_encoder = ContextEncoder(output_lang.n_word, arg.embed_size, arg.hidden_size)
@@ -334,11 +336,11 @@ def main(arg):
     print("Start training...")
     for epoch in range(arg.num_epoch):
         try:
-            '''
+
             print("epoch {}/{}".format(epoch+1, arg.num_epoch))
             epoch_loss = train(train_data, batch_object, encoder, context_encoder, decoder, encoder_optimizer, context_optimizer, decoder_optimizer, criterion)
             print("train loss: {:.4f}".format(epoch_loss))
-            '''
+
             dev_loss, accuracy = eval(dev_data, batch_object, encoder, context_encoder, decoder, criterion)
             print("dev loss: {:.4f} accuracy: {:.4f}".format(dev_loss, accuracy))
 

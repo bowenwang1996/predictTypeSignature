@@ -64,12 +64,6 @@ class Lang:
         self.idx_to_token = idx_dict
         self.token_to_idx = token_dict
 
-def segment(ident):
-    if ident in SPECIAL_SYMBOLS:
-        return [ident]
-    else:
-        return identifier_segmentor.segment(ident)
-
 def readSigTokens(filename):
     with open(filename, 'r') as f:
         tokens = f.read().split('\n')
@@ -121,12 +115,13 @@ def prepareData(filename, use_context=False, num_context_sig=3):
 def processLineWithFileName(line, full_path=False):
     [num, path, name_and_sig] = line.split('\t')
     filename = path.split('/')
+    dir_name = filename[-2]
     if full_path:
         filename[-1] = filename[-1].split('.')[0]
     else:
         filename = [path.split('/')[-1].split('.')[0]]
     [name, sig] = name_and_sig.split('::', 1)
-    return int(num), filename, name.strip(), sig.strip()
+    return int(num), filename, dir_name, name.strip(), sig.strip()
 
 # processes data with qualified name (full path to the file) and signatures
 def prepareDataWithFileName(filename, full_path=False, use_context=False, num_context_sig=3):
@@ -138,12 +133,12 @@ def prepareDataWithFileName(filename, full_path=False, use_context=False, num_co
     if use_context:
         context_sigs = []
         for line in lines:
-            num, fname, input_name, sig = processLineWithFileName(line, full_path)
+            num, fname, dir_name, input_name, sig = processLineWithFileName(line, full_path)
             cur_context = context_sigs[-num_context_sig:]
-            sigs = [ p[1] for p in cur_context if p[0] == num]
+            sigs = [ p[2] for p in cur_context if p[0] == num or p[1] == dir_name]
             name = fname + [input_name]
             data.append((name, sig, sigs))
-            context_sigs.append([num, sig])
+            context_sigs.append([num, dir_name, sig])
             for ident in name:
                 input_lang.add_name(ident)
             output_lang.add_sig(sig)
