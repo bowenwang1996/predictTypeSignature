@@ -144,7 +144,7 @@ def prepareDataWithFileName(filename, full_path=False, use_context=False, num_co
             output_lang.add_sig(sig)
     else:
         for line in lines:
-            _, fname, input_name, sig = processLineWithFileName(line, full_path)
+            _, fname, _, input_name, sig = processLineWithFileName(line, full_path)
             name = fname + [input_name]
             for ident in name:
                 input_lang.add_name(ident)

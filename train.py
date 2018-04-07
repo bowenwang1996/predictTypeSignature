@@ -37,19 +37,20 @@ parser.add_argument("--use_qualified_name", default=0, type=int,
 parser.add_argument("--use_full_path", default=0, type=int)
 
 parser.add_argument("--train_data_qualified", metavar="QUALIFED TRAIN DATA",
-                    default="data/data_with_file_names/train_simple_sigs_parsable_normalized.txt")
+                    default="data/new_data/train_simple_sigs_parsable_normalized.txt")
 
 parser.add_argument("--dev_data_qualified", metavar="QUALIFED DEV DATA",
-                    default="data/data_with_file_names/dev_simple_sigs_parsable_normalized.txt")
+                    default="data/new_data/dev_simple_sigs_parsable_normalized.txt")
 
 parser.add_argument("--test_data_qualified", metavar="QUALIFED TEST DATA",
-                    default="data/data_with_file_names/test_simple_sigs_parsable_normalized.txt")
+                    default="data/new_data/test_simple_sigs_parsable_normalized.txt")
 
 parser.add_argument("--encoder_state_file", default="encoder_state.pth")
 parser.add_argument("--decoder_state_file", default="decoder_state.pth")
 parser.add_argument("--batch_size", default=32, type=int)
 parser.add_argument("--eval_batch_size", default=8, type=int)
 parser.add_argument("--hidden_size", default=256, type=int)
+parser.add_argument("--embed_size", default=128, type=int)
 parser.add_argument("--grad_clip", default=4.0, type=float)
 parser.add_argument("--num_epoch", default=50, type=int)
 parser.add_argument("--dump_result", default=0, type=int)
@@ -149,7 +150,7 @@ def step(input_variable, input_lengths, target_variable, target_lengths, encoder
     else:
         encoder.eval()
         decoder.eval()
-        
+
     batch_size = input_variable.size(0)
     encoder_hidden = encoder.initHidden(batch_size)
     if use_cuda:
@@ -189,7 +190,7 @@ def step(input_variable, input_lengths, target_variable, target_lengths, encoder
         clip = 4
         torch.nn.utils.clip_grad_norm(encoder.parameters(), clip)
         torch.nn.utils.clip_grad_norm(decoder.parameters(), clip)
-        
+
         encoder_optimizer.step()
         decoder_optimizer.step()
     return loss.data[0]/batch_size
@@ -323,15 +324,15 @@ def main(arg):
     #dev_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(original_dev_data, arg.eval_batch_size))
 
     dump = arg.dump_result == 1
-    encoder = Encoder(input_lang.n_word, arg.hidden_size)
-    decoder = AttnDecoder(output_lang.n_word, arg.hidden_size)
+    encoder = Encoder(input_lang.n_word, arg.embed_size, arg.hidden_size)
+    decoder = AttnDecoder(output_lang.n_word, arg.embed_size, arg.hidden_size)
     if use_cuda:
         encoder = encoder.cuda()
         decoder = decoder.cuda()
     encoder_optimizer = optim.Adam(encoder.parameters(), lr=2e-4)
     decoder_optimizer = optim.Adam(decoder.parameters(), lr=2e-4)
     criterion = nn.NLLLoss(reduce=False)
-    
+
     best_accuracy = 0
     best_model = (encoder.state_dict(), decoder.state_dict())
     print("Start training...")
@@ -344,7 +345,7 @@ def main(arg):
             dev_loss, accuracy = eval(dev_data, input_lang, output_lang, encoder, decoder, criterion)
             print("dev loss: {:.4f} accuracy: {:.4f}".format(dev_loss, accuracy))
             randomEval(original_dev_data, encoder, decoder, input_lang, output_lang)
-            
+
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
                 best_model = (encoder.state_dict(), decoder.state_dict())
@@ -381,8 +382,7 @@ def main(arg):
                     writer.writerow(row)
         write_results(dev_results, arg.dev_result)
         write_results(test_results, arg.test_results)
-    
+
 if __name__ == "__main__":
     arg = parser.parse_args()
     main(arg)
-    

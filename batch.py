@@ -82,7 +82,7 @@ class Batch():
             for token in tokens:
                 if token[0].isupper():
                     token = token.split(".")[-1]
-                if token in self.target_vocab.token_to_idx:
+                if token in self.target_vocab.token_to_idx and token not in SPECIAL_SYMBOLS:
                     indices.append(self.target_vocab.token_to_idx[token])
                 elif token in oov_idx_dict:
                     indices.append(oov_idx_dict[token])

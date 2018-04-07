@@ -111,19 +111,26 @@ class AttnDecoder(nn.Module):
         return hidden
 
 class Attn(nn.Module):
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_size, use_coverage=False):
         super(Attn, self).__init__()
-        self.attn = nn.Linear(hidden_size, hidden_size)
+        if use_coverage:
+            self.attn = nn.Linear(hidden_size, hidden_size + 1)
+        else:
+            self.attn = nn.Linear(hidden_size, hidden_size)
         self.attn_combine = nn.Linear(hidden_size * 2, hidden_size)
 
-    def forward(self, decoder_out, encoder_outputs, score_only=False, context_only=False):
+    def forward(self, decoder_out, encoder_outputs, coverage=None, score_only=False, context_only=False):
         '''
         decoder_out: B * 1 * H
         encoder_outputs: B * T * H
         returns: transformed decoder output and attention scores
         '''
         decoder_out = self.attn(decoder_out)
-        attn_scores = torch.bmm(encoder_outputs, decoder_out.transpose(1, 2))
+        if coverage is not None:
+            concat_tensor = torch.cat((encoder_outputs, coverage.unsqueeze(2)), 2)
+            attn_scores = torch.bmm(concat_tensor, decoder_out.transpose(1, 2))
+        else:
+            attn_scores = torch.bmm(encoder_outputs, decoder_out.transpose(1, 2))
         attn_scores = F.softmax(attn_scores, dim=1).transpose(1, 2)
         if score_only:
             return attn_scores.squeeze(1)
@@ -155,7 +162,7 @@ class ContextAttnDecoder(nn.Module):
         self.embedding = nn.Embedding(vocab_size, embed_size)
         self.rnn = nn.LSTM(embed_size, hidden_size, batch_first=True, num_layers=n_layers)
         self.attn = Attn(hidden_size)
-        self.context_attn = Attn(hidden_size)
+        self.context_attn = Attn(hidden_size, use_coverage=True)
         self.gen_prob = nn.Linear(3 * hidden_size + embed_size, 1)
         self.sigmoid = SigmoidBias(1)
         self.dropout_p = dropout_p
@@ -163,14 +170,14 @@ class ContextAttnDecoder(nn.Module):
         self.out = nn.Linear(hidden_size, vocab_size)
 
 
-    def forward(self, input, hidden, encoder_outputs, context_encoder_outputs, context_input):
+    def forward(self, input, hidden, encoder_outputs, context_encoder_outputs, context_input, coverage):
         batch_size = input.size(0)
         input_len = input.size(1)
         context_input_len = context_input.size(1)
         embedded = self.embedding(input).view(batch_size, input_len, -1) # B * 1 * H
         output, hidden = self.rnn(embedded, hidden)
         context = self.attn(output, encoder_outputs, context_only=True)
-        context_attn_scores = self.context_attn(output, context_encoder_outputs, score_only=True)
+        context_attn_scores = self.context_attn(output, context_encoder_outputs, coverage=coverage, score_only=True)
         context_context = torch.bmm(context_attn_scores.unsqueeze(1), context_encoder_outputs).squeeze(1)
         p_gen = self.sigmoid(self.gen_prob(torch.cat((context, context_context, output.view(batch_size, -1), embedded.view(batch_size, -1)), 1)))
 
@@ -196,4 +203,4 @@ class ContextAttnDecoder(nn.Module):
         p_copy.put_(linearized_indices, value_to_add, accumulate=True)
         output_prob = p_gen * p_vocab + (1 - p_gen) * p_copy
 
-        return torch.log(output_prob.clamp(min=1e-10)), hidden
+        return torch.log(output_prob.clamp(min=1e-10)), hidden, context_attn_scores

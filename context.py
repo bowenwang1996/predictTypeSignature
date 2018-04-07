@@ -104,18 +104,24 @@ def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer,
     length_tensor = torch.LongTensor(trainInfo.target_lengths)
     # at the begining, no sequence has ended so we use -1 as its end index
     eos_tensor = torch.LongTensor(batch_size).fill_(-1)
+    context_attn_sum = Variable(torch.zeros(batch_size, max(trainInfo.context_lengths)))
     if use_cuda:
         decoder_input = decoder_input.cuda()
         length_tensor = length_tensor.cuda()
         eos_tensor = eos_tensor.cuda()
+        context_attn_sum = context_attn_sum.cuda()
 
     for i in range(target_len):
-        decoder_output, decoder_hidden = decoder(decoder_input,
-                                                 decoder_hidden,
-                                                 encoder_outputs,
-                                                 context_encoder_outputs,
-                                                 trainInfo.context_variable)
-        cur_loss = criterion(decoder_output, trainInfo.target_variable[:, i])
+        decoder_output, decoder_hidden, context_attn = decoder(decoder_input,
+                                                               decoder_hidden,
+                                                               encoder_outputs,
+                                                               context_encoder_outputs,
+                                                               trainInfo.context_variable,
+                                                               context_attn_sum)
+        nll_loss = criterion(decoder_output, trainInfo.target_variable[:, i])
+        coverage_loss = torch.sum(torch.min(context_attn, context_attn_sum), 1)
+        cur_loss = nll_loss + coverage_loss
+        context_attn_sum = context_attn_sum + context_attn
         loss_mask = (length_tensor > i) & (eos_tensor == -1)
         loss_mask = Variable(loss_mask).cuda() if use_cuda else Variable(loss_mask)
         loss += torch.masked_select(cur_loss, loss_mask).sum()
@@ -200,6 +206,10 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
               for _ in range(batch_size)
             ]
     decoder_hiddens = [decoder_hidden for _ in range(beam_size)]
+    context_attn_sum = Variable(torch.zeros(batch_size, max(trainInfo.context_lengths)))
+    if use_cuda:
+        context_attn_sum = context_attn_sum.cuda()
+    context_attn_sums = [context_attn_sum for _ in range(beam_size)]
     for i in range(max_length):
         if all([b.done() for b in beams]):
             break
@@ -210,12 +220,14 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
         decoder_in = Variable(batch.unk_batch(decoder_in))
         word_probs = []
         for j in range(beam_size):
-            decoder_out, decoder_hidden = decoder(decoder_in[j],
-                                                  decoder_hiddens[j],
-                                                  encoder_outputs,
-                                                  context_encoder_outputs,
-                                                  trainInfo.context_variable)
+            decoder_out, decoder_hidden, context_attn = decoder(decoder_in[j],
+                                                                decoder_hiddens[j],
+                                                                encoder_outputs,
+                                                                context_encoder_outputs,
+                                                                trainInfo.context_variable,
+                                                                context_attn_sums[j])
             decoder_hiddens[j] = decoder_hidden
+            context_attn_sums[j] = context_attn_sums[j] + context_attn
             word_probs.append(decoder_out)
         word_probs = torch.cat(word_probs, 0).data
         for j, b in enumerate(beams):
