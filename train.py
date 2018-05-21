@@ -6,32 +6,31 @@ import time
 import math
 import random
 import argparse
+import copy
+import subprocess
 
 from identifier_segmentor import segment
-from prepare_data import readSigTokens, prepareData, start_token, end_token, unk_token, prepareDataWithFileName
-from model import Encoder, Decoder, AttnDecoder
+from prepare_data import readSigTokens, prepareData, start_token, unk_token, arrow_token, prepareDataWithFileName
+from model import Encoder, Decoder, AttnDecoder, Model
 from utils import *
+from type_signatures import Tree
 
 use_cuda = torch.cuda.is_available()
 parser = argparse.ArgumentParser(description="train model")
 
 parser.add_argument("--train_data", metavar="TRAIN DATA",
-                    default="data/train_simple_sigs_parsable_normalized.txt",
+                    default="data/new_data/train_simple_sigs_parsable_normalized.txt",
                     )
 
 parser.add_argument("--dev_data", metavar="DEV DATA",
-                    default="data/dev_simple_sigs_parsable_normalized.txt",
+                    default="data/new_data/dev_simple_sigs_parsable_normalized.txt",
                     )
 
 parser.add_argument("--test_data", metavar="TEST DATA",
-                    default="data/test_simple_sigs_parsable_normalized.txt",
+                    default="data/new_data/test_simple_sigs_parsable_normalized.txt",
                     )
 
-parser.add_argument("--type_token_data", metavar="TYPE TOKEN",
-                    default="data/simple_types_vocab.txt"
-                    )
-
-parser.add_argument("--use_qualified_name", default=0, type=int,
+parser.add_argument("--use_qualified_name", default=1, type=int,
                     help="0 for not using qualified name, 1 for using qualified name"
                     )
 parser.add_argument("--use_full_path", default=0, type=int)
@@ -45,29 +44,18 @@ parser.add_argument("--dev_data_qualified", metavar="QUALIFED DEV DATA",
 parser.add_argument("--test_data_qualified", metavar="QUALIFED TEST DATA",
                     default="data/new_data/test_simple_sigs_parsable_normalized.txt")
 
-parser.add_argument("--encoder_state_file", default="encoder_state.pth")
-parser.add_argument("--decoder_state_file", default="decoder_state.pth")
+parser.add_argument("--model_state_file", default="model_state.pth")
 parser.add_argument("--batch_size", default=32, type=int)
 parser.add_argument("--eval_batch_size", default=8, type=int)
 parser.add_argument("--hidden_size", default=256, type=int)
 parser.add_argument("--embed_size", default=128, type=int)
 parser.add_argument("--grad_clip", default=4.0, type=float)
+parser.add_argument("--rec_depth", default=6, type=int)
+parser.add_argument("--topo_loss_factor", default=1.0, type=float)
 parser.add_argument("--num_epoch", default=50, type=int)
 parser.add_argument("--dump_result", default=0, type=int)
 parser.add_argument("--dev_result", default="results/dev_result.csv")
-parser.add_argument("--test_results", default="results/test_result.csv")
 
-def indexFromSignature(sig, lang):
-    tokens = sig.split()
-    def foo(x):
-        if x[0].isupper():
-            token = x.split('.')[-1]
-        else:
-            token = x
-        return lang.lookup(token)
-    indices = map(foo, tokens)
-    indices.append(end_token)
-    return indices
 
 def indexFromSignatures(sigs, lang):
     '''
@@ -100,12 +88,11 @@ def indexFromName(name, lang):
     for ident in name:
         tokens += segment(ident)
     indices = map(lambda x: lang.lookup(x.lower()), tokens)
-    indices.append(end_token)
     return indices
 
 def variableFromName(name, lang):
     indices = indexFromName(name, lang)
-    var = Variable(torch.LongTensor(indices))
+    var = Variable(torch.LongTensor(indices)).unsqueeze(0)
     if use_cuda:
         var = var.cuda()
     return var
@@ -236,6 +223,28 @@ def generate_step(input_variable, input_lengths, encoder, decoder, max_length = 
         decoder_in = Variable(pred.unsqueeze(1))
     return decoded_tokens, eos_tensor
 
+def train(data, model, optimizer, dev_data=None, input_lang=None, output_lang=None):
+    epoch_loss = 0.0
+    start = time.time()
+    model.train()
+    for i, datum in enumerate(data):
+        input_variable, sig_tree = datum
+        input_len = input_variable.size(1)
+        loss = model(input_variable, [input_len], is_train=True, reference=sig_tree)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm(model.parameters(), arg.grad_clip)
+        optimizer.step()
+        epoch_loss += loss.data[0]
+        if (i + 1) % 10000 == 0:
+            print("checkpoint{} avg loss: {:.4f}".format((i+1)/10000, epoch_loss/(i+1)))
+            print("time since start: {}".format(timeSince(start)))
+        if (i + 1) % 100000 == 0 and dev_data is not None:
+            randomEval(dev_data, model, input_lang, output_lang)
+            model.train()
+    epoch_loss /= len(data)
+    print("epoch total training time: {}".format(timeSince(start)))
+    return epoch_loss
+'''
 def train(data, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion):
     epoch_loss = 0.0
     start = time.time()
@@ -248,32 +257,39 @@ def train(data, encoder, decoder, encoder_optimizer, decoder_optimizer, criterio
     epoch_loss /= len(data)
     print("epoch total training time:{}".format(timeSince(start)))
     return epoch_loss
+'''
 
-def eval(data, input_lang, output_lang, encoder, decoder, criterion, is_test=False):
+def eval(data, input_vocab, output_vocab, model, is_test=False):
+    model.eval()
     num_correct = 0
-    loss = 0
-    data_len = len(data)
-    batch_size = None
-    for batch in data:
-        input_variable, input_lengths, output_variable, output_lengths = variableFromBatch(batch, input_lang, output_lang)
-        decoded_tokens, eos_tensor = generate_step(input_variable, input_lengths, encoder, decoder)
-        batch_size = input_variable.size(0)
-        batch = sorted(batch, key=lambda p: len(indexFromName(p[0], input_lang)), reverse=True)
-        for i in range(batch_size):
-            _, sig = batch[i]
-            predict_sig = tokensToString(decoded_tokens[i, :eos_tensor[i]], output_lang)
-            if predict_sig == process_sig(sig):
-                num_correct += 1
+    num_structural_correct = 0
+    eval_loss = 0
+    dev_output = "results/dev_output"
+    subprocess.call("rm {}".format(dev_output), shell=True)
+    for name, sig in data:
+        input_variable = variableFromName(name, input_vocab)
+        input_len = input_variable.size(1)
+        sig_tree = Tree.from_str(sig)
         if not is_test:
-            loss += eval_step(input_variable, input_lengths, output_variable, output_lengths, encoder, decoder, criterion)
-    accuracy = float(num_correct)/(data_len * batch_size)
-    if is_test:
-        return accuracy
-    else:
-        return loss/data_len, accuracy
+            index_tree = copy.deepcopy(sig_tree).to_index(output_vocab.token_to_idx, unk_token)
+            loss = model(input_variable, [input_len], is_train=True, reference=index_tree)
+            eval_loss += loss.data[0]
+        gen_result = model(input_variable, [input_len])
+        if gen_result.to_str(output_vocab.idx_to_token) == sig_tree:
+            num_correct += 1
+        if gen_result.structural_eq(sig_tree):
+            num_structural_correct += 1
+        with open(dev_output, "a+") as f:
+            f.write("name: {}\n".format(name))
+            f.write("sig: {}\n".format(sig))
+            f.write("prediction: {}\n".format(gen_result.to_sig()))
+            f.write("\n")
+    if not is_test:
+        return eval_loss/len(data), float(num_correct)/len(data), float(num_structural_correct)/len(data)
+    return float(num_correct)/len(data), float(num_structural_correct)/len(data)
 
-def eval_test(data, input_lang, output_lang, encoder, decoder):
-    return eval(data, input_lang, output_lang, encoder, decoder, None, is_test=True)
+def eval_test(data, input_lang, output_lang, model):
+    return eval(data, input_lang, output_lang, model, is_test=True)
 
 def tokensToString(tokens, lang):
     if tokens[-1] == end_token:
@@ -284,13 +300,13 @@ def tokensToString(tokens, lang):
     return s.rstrip()
 
 # data should be in original format (i.e. string)
-def randomEval(data, encoder, decoder, input_lang, output_lang):
+def randomEval(data, model, input_lang, output_lang):
+    model.eval()
     name, sig = random.choice(data)
     input_variable = variableFromName(name, input_lang)
-    input_lengths = [len(input_variable)]
-    decoded_tokens, eos_tensor = generate_step(input_variable.unsqueeze(0), input_lengths, encoder, decoder)
-    decoded_tokens = decoded_tokens.squeeze(0)[:eos_tensor[0]].tolist()
-    predict_sig = tokensToString(decoded_tokens, output_lang)
+    gen_result = model(input_variable, [input_variable.size(1)])
+    gen_result.to_str(output_lang.idx_to_token)
+    predict_sig = gen_result.to_sig()
     print(name)
     print(sig)
     print(predict_sig)
@@ -312,56 +328,54 @@ def main(arg):
     if arg.use_qualified_name == 1:
         use_full_path = arg.use_full_path == 1
         input_lang, output_lang, train_data = prepareDataWithFileName(arg.train_data_qualified, use_full_path)
-        _, _, original_dev_data = prepareDataWithFileName(arg.dev_data_qualified, use_full_path)
-        _, _, original_test_data = prepareDataWithFileName(arg.test_data_qualified, use_full_path)
+        _, _, dev_data = prepareDataWithFileName(arg.dev_data_qualified, use_full_path)
+        _, _, test_data = prepareDataWithFileName(arg.test_data_qualified, use_full_path)
     else:
         input_lang, output_lang, train_data = prepareData(arg.train_data)
-        _, _, original_dev_data = prepareData(arg.dev_data)
-        _, _, original_test_data = prepareData(arg.test_data)
+        _, _, dev_data = prepareData(arg.dev_data)
+        _, _, test_data = prepareData(arg.test_data)
 
-    train_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(train_data, arg.batch_size))
-    dev_data = batchify(original_dev_data, arg.eval_batch_size)
-    #dev_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(original_dev_data, arg.eval_batch_size))
+    train_data = map(lambda p: (variableFromName(p[0], input_lang), Tree.from_str(p[1]).to_index(output_lang.token_to_idx, unk_token)), train_data)
 
-    dump = arg.dump_result == 1
-    encoder = Encoder(input_lang.n_word, arg.embed_size, arg.hidden_size)
-    decoder = AttnDecoder(output_lang.n_word, arg.embed_size, arg.hidden_size)
+    weight = [10 * math.sqrt(1.0/output_lang.token_to_count[output_lang.idx_to_token[x]])
+              for x in output_lang.idx_to_token if x > arrow_token]
+    weight = [0] * (arrow_token + 1) + weight
+    loss_weight = torch.FloatTensor(weight)
+    # dump = arg.dump_result == 1
+    model = Model(input_lang.n_word, output_lang.n_word, arg.embed_size,
+                  arg.hidden_size, output_lang.kind_dict,
+                  topo_loss_factor=arg.topo_loss_factor, rec_depth=arg.rec_depth,
+                  weight=loss_weight)
     if use_cuda:
-        encoder = encoder.cuda()
-        decoder = decoder.cuda()
-    encoder_optimizer = optim.Adam(encoder.parameters(), lr=2e-4)
-    decoder_optimizer = optim.Adam(decoder.parameters(), lr=2e-4)
-    criterion = nn.NLLLoss(reduce=False)
+        model = model.cuda()
+    optimizer = optim.Adam(model.parameters(), lr=2e-4)
 
     best_accuracy = 0
-    best_model = (encoder.state_dict(), decoder.state_dict())
+    best_model = model.state_dict()
     print("Start training...")
     for epoch in range(arg.num_epoch):
         try:
             epoch_loss = 0
             print("epoch {}/{}".format(epoch+1, arg.num_epoch))
-            epoch_loss = train(train_data, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion)
+            epoch_loss = train(train_data, model, optimizer, dev_data=dev_data, input_lang=input_lang, output_lang=output_lang)
             print("train loss: {:.4f}".format(epoch_loss))
-            dev_loss, accuracy = eval(dev_data, input_lang, output_lang, encoder, decoder, criterion)
-            print("dev loss: {:.4f} accuracy: {:.4f}".format(dev_loss, accuracy))
-            randomEval(original_dev_data, encoder, decoder, input_lang, output_lang)
+            dev_loss, accuracy, structural_acc = eval(dev_data, input_lang, output_lang, model)
+            print("dev loss: {:.4f} accuracy: {:.4f} structural accuracy: {:.4f}".format(dev_loss, accuracy, structural_acc))
+            randomEval(dev_data, model, input_lang, output_lang)
 
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
-                best_model = (encoder.state_dict(), decoder.state_dict())
-                torch.save(best_model[0], arg.encoder_state_file)
-                torch.save(best_model[1], arg.decoder_state_file)
+                best_model = model.state_dict()
+                torch.save(best_model, arg.model_state_file)
         except KeyboardInterrupt:
-          print("Keyboard Interruption.")
-          break
+            print("Keyboard Interruption.")
+            break
     print("best accuracy: {:.4f}".format(best_accuracy))
     print("Start testing...")
-    #test_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(original_test_data, arg.eval_batch_size))
-    test_data = batchify(original_test_data, arg.eval_batch_size)
-    encoder.load_state_dict(torch.load(arg.encoder_state_file))
-    decoder.load_state_dict(torch.load(arg.decoder_state_file))
-    test_accuracy = eval_test(test_data, input_lang, output_lang, encoder, decoder)
-    print("test accuracy: {:.4f}".format(test_accuracy))
+    model.load_state_dict(torch.load(arg.model_state_file))
+    accuracy, structural_acc = eval_test(test_data, input_lang, output_lang, model)
+    print("test accuracy: {:.4f} structural accuracy: {:.4f}".format(accuracy, structural_acc))
+    '''
     if dump:
         import csv
         dev_results = resultDump(dev_data, encoder, decoder, input_lang, output_lang)
@@ -382,7 +396,7 @@ def main(arg):
                     writer.writerow(row)
         write_results(dev_results, arg.dev_result)
         write_results(test_results, arg.test_results)
-
+    '''
 if __name__ == "__main__":
     arg = parser.parse_args()
     main(arg)

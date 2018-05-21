@@ -1,5 +1,7 @@
 import time
 import math
+import torch
+from torch.autograd import Variable
 
 # thanks to https://stackoverflow.com/questions/6422700/how-to-get-indices-of-a-sorted-array-in-python
 def get_sort_index(arr):
@@ -34,3 +36,12 @@ def process_sig(sig):
         else:
             new_sig += token
     return new_sig.rstrip()
+
+def singleton_variable(token, batch_size, use_cuda):
+    if batch_size == 0:
+        var = Variable(torch.LongTensor([token]))
+    else:
+        var = Variable(torch.LongTensor(batch_size, 1).fill_(token))
+    if use_cuda:
+        var = var.cuda()
+    return var

@@ -3,10 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from collections import Counter
 
 #import time
 from utils import *
+from prepare_data import arrow_token, start_token, unk_token
+from type_signatures import Tree
 
 use_cuda = torch.cuda.is_available()
 #use_cuda = False
@@ -65,7 +66,7 @@ class Decoder(nn.Module):
         output = embedded
         for i in range(self.n_layers):
             output, hidden = self.rnn(embedded, hidden)
-        output = F.log_softmax(self.out(output[0]))
+        output = F.log_softmax(self.out(output[0]), dim=1)
         return output, hidden
 
 class AttnDecoder(nn.Module):
@@ -204,3 +205,190 @@ class ContextAttnDecoder(nn.Module):
         output_prob = p_gen * p_vocab + (1 - p_gen) * p_copy
 
         return torch.log(output_prob.clamp(min=1e-10)), hidden, context_attn_scores
+
+class BaseType(nn.Module):
+    '''
+    submodule for handling base types
+    '''
+    def __init__(self, vocab_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
+        super(BaseType, self).__init__()
+        self.rnn = nn.LSTM(embed_size, hidden_size, num_layers=n_layers, dropout=dropout_p, batch_first=True)
+        self.parent_proj = nn.Linear(hidden_size, hidden_size)
+        self.frat_proj = nn.Linear(hidden_size, hidden_size)
+        self.attn = Attn(hidden_size)
+        self.out = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, input, parent_hidden, frat_hidden, encoder_outputs):
+        '''
+        input should already be embedded here (done in Type module)
+        '''
+        hidden = (F.tanh(self.parent_proj(parent_hidden[0]) + self.frat_proj(frat_hidden[0])),
+                  F.tanh(self.parent_proj(parent_hidden[1]) + self.frat_proj(frat_hidden[1])))
+        output, hidden = self.rnn(input, hidden)
+        output = self.attn(output, encoder_outputs)
+        output = self.out(output.squeeze(1))
+        output = F.log_softmax(output, dim=1)
+        return output, hidden
+
+class ArrowType(nn.Module):
+    '''
+    submodule for handling arrow types
+    '''
+    def __init__(self, vocab_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
+        #self.arrow_embedding = nn.Parameter(torch.Tensor(embed_size))
+        #self.arrow_embedding.data.uniform_(-0.1, 0.1)
+        super(ArrowType, self).__init__()
+        self.parent_proj = nn.Linear(hidden_size, hidden_size)
+        self.frat_proj = nn.Linear(hidden_size, hidden_size)
+        self.attn = Attn(hidden_size)
+        self.rnn = nn.LSTM(embed_size, hidden_size, num_layers=n_layers, dropout=dropout_p, batch_first=True)
+        self.out = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, input, parent_hidden, frat_hidden, encoder_outputs):
+        hidden = (F.tanh(self.parent_proj(parent_hidden[0]) + self.frat_proj(frat_hidden[0])),
+                  F.tanh(self.parent_proj(parent_hidden[1]) + self.frat_proj(frat_hidden[1])))
+        output, hidden = self.rnn(input, hidden)
+        output = self.attn(output, encoder_outputs)
+        output = self.out(output.squeeze(1))
+        output = F.log_softmax(output, dim=1)
+        return hidden
+
+class Type(nn.Module):
+    '''
+    module for handling type generation
+    '''
+    def __init__(self,
+                 vocab_size, embed_size, hidden_size,
+                 kind_dict, topo_loss_factor=1,
+                 n_layers=1, dropout_p=0.0, weight=None):
+        super(Type, self).__init__()
+        self.num_modules = 2
+        self.module_selector = nn.Sequential(
+                                    nn.Linear(hidden_size, hidden_size/2),
+                                    nn.ReLU(),
+                                    nn.Linear(hidden_size/2, self.num_modules),
+                                    nn.LogSoftmax(dim=0)
+                                   )
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.base_module = BaseType(vocab_size, embed_size, hidden_size)
+        self.arrow_module = ArrowType(vocab_size, embed_size, hidden_size)
+        self.kind_dict = kind_dict
+        self.kind_dict[unk_token] = 0
+        self.kind_zero = [x for x in kind_dict if kind_dict[x] == 0]
+        self.actual_token_pos = arrow_token + 1  # where actual token starts
+        self.topo_crit = nn.NLLLoss()
+        self.crit = nn.NLLLoss(weight=weight)
+        self.topo_loss_factor = topo_loss_factor
+
+    def forward(self, input, parent_hidden, frat_hidden, encoder_outputs,
+                is_train=False, reference=None, rec_depth=None,
+                wrap_result=True):
+        '''
+        if is_train, the module returns loss and hidden states.
+        Otherwise, it returns the actual tokens, along with hidden states
+        '''
+        batch_size = input.size(0)
+        input_len = input.size(1)
+        embed = self.embedding(input).view(batch_size, input_len, -1)
+        # assuming batch_size = 1 here, need to be changed later
+        choice_probs = self.module_selector(parent_hidden[0].view(-1))
+        is_baseType = (choice_probs[0] > choice_probs[1]).data[0]
+        if is_train:
+            # compute topology loss
+            target = 1 if reference.node == arrow_token else 0
+            target = singleton_variable(target, 0, use_cuda)
+            loss = self.topo_loss_factor * self.topo_crit(choice_probs.unsqueeze(0), target)
+            is_baseType = reference.node != arrow_token
+        else:
+            if rec_depth == 0:
+                is_baseType = True
+        if is_baseType:
+            output, frat_hidden = self.base_module(embed, parent_hidden, frat_hidden, encoder_outputs)
+            if rec_depth == 0:
+                # reach depth 0, can only generate type of kind *
+                _, indices = torch.topk(output.data[:, self.kind_zero], 1)
+                # a hack here
+                data_constructor = torch.LongTensor(1, 1).fill_(self.kind_zero[indices[0][0]])
+            else:
+                _, data_constructor = torch.topk(output.data[:, self.actual_token_pos:], 1)
+                data_constructor = data_constructor + self.actual_token_pos
+            if is_train:
+                constructor_token = reference.node if type(reference.node) is int else reference.node[0]
+                target = singleton_variable(constructor_token, 0, use_cuda)
+                loss += self.crit(output, target)
+                kind = self.kind_dict[constructor_token]
+                data_constructor = singleton_variable(constructor_token, batch_size, use_cuda)
+            else:
+                kind = self.kind_dict[data_constructor[0][0]]
+                data_constructor = Variable(data_constructor)
+            results = [data_constructor.data[0][0]]
+            for i in range(kind):
+                if is_train:
+                    if type(reference.node[i+1]) is int:
+                        cur_reference = Tree(reference.node[i+1])
+                    else:
+                        cur_reference = reference.node[i+1]
+                    cur_loss, parent_hidden, frat_hidden = self(data_constructor, parent_hidden, frat_hidden, encoder_outputs, is_train, cur_reference)
+                    loss += cur_loss
+                else:
+                    cur_result, parent_hidden, frat_hidden = self(data_constructor, parent_hidden, frat_hidden, encoder_outputs, rec_depth=rec_depth-1, wrap_result=False)
+                    results.append(cur_result)
+            if is_train:
+                return loss, parent_hidden, frat_hidden
+            if not wrap_result and len(results) == 1:
+                return results[0], parent_hidden, frat_hidden
+            return Tree.singleton(results), parent_hidden, frat_hidden
+        else:
+            parent_hidden = self.arrow_module(embed, parent_hidden, frat_hidden, encoder_outputs)
+            arrow_tensor = singleton_variable(arrow_token, batch_size, use_cuda)
+            if is_train:
+                left_loss, _, frat_hidden = self(arrow_tensor, parent_hidden, frat_hidden, encoder_outputs, is_train, reference.left)
+                right_loss, _, frat_hidden = self(arrow_tensor, parent_hidden, frat_hidden, encoder_outputs, is_train, reference.right)
+                loss += left_loss + right_loss
+                return loss, parent_hidden, frat_hidden
+            else:
+                left_result, _, frat_hidden = self(arrow_tensor, parent_hidden, frat_hidden, encoder_outputs, rec_depth=rec_depth-1)
+                right_result, _, frat_hidden = self(arrow_tensor, parent_hidden, frat_hidden, encoder_outputs, rec_depth=rec_depth-1)
+                return Tree.from_children(arrow_token, left_result, right_result), parent_hidden, frat_hidden
+
+class Model(nn.Module):
+    '''
+    final model for structured Prediction
+    '''
+    def __init__(self, input_vocab_size, target_vocab_size,
+                 embed_size, hidden_size,
+                 kind_dict,
+                 n_layers=1, dropout_p=0.0,
+                 topo_loss_factor=1, rec_depth=6,
+                 weight=None):
+        super(Model, self).__init__()
+        self.hidden_size = hidden_size
+        self.encoder = Encoder(input_vocab_size, embed_size, hidden_size,
+                               n_layers=n_layers, dropout_p=dropout_p)
+        self.decoder = Type(target_vocab_size, embed_size, hidden_size,
+                            kind_dict, n_layers, dropout_p, weight=weight)
+        self.rec_depth = rec_depth
+
+    def forward(self, input_seq, lengths, is_train=False, reference=None):
+        '''
+        input_seq: a sequence of tokens representing the names
+        '''
+        batch_size = input_seq.size(0)
+        hidden = self.encoder.initHidden(batch_size)
+        if use_cuda:
+            hidden = (hidden[0].cuda(), hidden[1].cuda())
+        encoder_outputs, encoder_hidden = self.encoder(input_seq, lengths, hidden)
+        parent_hidden = (encoder_hidden[0].view(1, batch_size, -1),
+                         encoder_hidden[1].view(1, batch_size, -1))
+        frat_hidden = (Variable(torch.zeros(1, batch_size, self.hidden_size)),
+                       Variable(torch.zeros(1, batch_size, self.hidden_size)))
+        decoder_in = Variable(torch.LongTensor(batch_size, 1).fill_(start_token))
+        if use_cuda:
+            frat_hidden = (frat_hidden[0].cuda(), frat_hidden[1].cuda())
+            decoder_in = decoder_in.cuda()
+        if is_train:
+            loss, _, _ = self.decoder(decoder_in, parent_hidden, frat_hidden, encoder_outputs, is_train, reference)
+            return loss
+        else:
+            results, _, _ = self.decoder(decoder_in, parent_hidden, frat_hidden, encoder_outputs, rec_depth=self.rec_depth)
+            return results
