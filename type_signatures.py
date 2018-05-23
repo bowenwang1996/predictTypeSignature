@@ -8,6 +8,7 @@
 import re
 import string
 import copy
+from functools import reduce
 
 # From the Haskell 2010 Report:
 #
@@ -76,7 +77,7 @@ import copy
 
 ##### PARSING HELPERS ########
 
-WS       = re.compile(ur'\s+')
+WS       = re.compile(r'\s+')
 
 def parse_zero_or_more(parser, s):
   results = [([], s)]
@@ -160,12 +161,12 @@ def require_ws(s):
 
 ##### TYPE PARSING ######
 
-WS_ARROW = re.compile(ur' ->| →')
-ARROW    = re.compile(ur'->|→')
-IMPLIES  = re.compile(ur'=>|⇒')
+WS_ARROW = re.compile(r' ->| →')
+ARROW    = re.compile(r'->|→')
+IMPLIES  = re.compile(r'=>|⇒')
 # Written this way to exclude bare arrows and bare implies
 # Includes: () [] (->) (,+)
-NAME    = re.compile(ur'[^\=\-\s\[\]\(\),][^\s\[\]\(\),]+|[^\s\[\]\(\),][^>\s\[\]\(\),]+|\(\)|\[\]|\(->\)|\(,+\)|[^\s\[\]\(\),→⇒]')
+NAME    = re.compile(r'[^\=\-\s\[\]\(\),][^\s\[\]\(\),]+|[^\s\[\]\(\),][^>\s\[\]\(\),]+|\(\)|\[\]|\(->\)|\(,+\)|[^\s\[\]\(\),→⇒]')
 
 # Contextual_type = contexts+:{Context} root_type:Root_type ;
 def parse_contextual_type(s):
@@ -394,14 +395,14 @@ def parse_sig(sig_str):
   if len(full_results) == 1:
     return full_results[0]
   elif len(full_results) > 1:
-    print sig_str
+    print(sig_str)
     for result in full_results:
-      print result
-    raise ValueError, "ambiguous parse"
+      print(result)
+    raise ValueError("ambiguous parse")
   elif len(full_results) == 0:
-    print "could not parse:",sig_str
-    print "longest parse: '%s'" % sig_str[0:longest_parse]
-    raise ValueError, "incomplete parse"
+    print("could not parse:",sig_str)
+    print("longest parse: '%s'" % sig_str[0:longest_parse])
+    raise ValueError("incomplete parse")
 
 
 # start = Contextual_type $ ;
@@ -466,7 +467,7 @@ def unparse_atype(atype):
   elif atype["parened"]:
     return "( " + unparse_root_type(atype["parened"]) + " )"
   else:
-    raise ValueError, "bad atype in unparse: " + str(atype)
+    raise ValueError("bad atype in unparse: " + str(atype))
 
 def normalize_type_variables(sig_str):
   sig = parse_sig(sig_str)
@@ -504,7 +505,7 @@ def sig_to_sexp(sig):
   if "root_type" in sig:
     return root_type_to_sexp(sig["root_type"])
   else:
-    raise ValueError, "could convert sig to sexp: " + str(sig)
+    raise ValueError("could convert sig to sexp: " + str(sig))
 
 def root_type_to_sexp(root):
   left = type_app_to_sexp(root["type_app"])
@@ -538,12 +539,12 @@ def atype_to_sexp(atype):
   elif atype["parened"]:
     return root_type_to_sexp(atype["parened"])
   else:
-    raise ValueError, "bad atype in conversion to sexp: " + str(atype)
+    raise ValueError("bad atype in conversion to sexp: " + str(atype))
 
 
 ##### SEXP NORMALIZATION ######
 
-LOWERCASE = re.compile(ur'[a-z]')
+LOWERCASE = re.compile(r'[a-z]')
 # We elsewhere limit the size of type signatures we'll parse, so this is more than sufficient.
 TYPE_VARS = list(string.ascii_lowercase) + [l1 + l2 for l1 in string.ascii_lowercase for l2 in string.ascii_lowercase]
 

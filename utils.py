@@ -26,7 +26,7 @@ def timeSince(since):
 
 # pad each list in the batch to length l
 def pad_to_len(batch, l):
-    return map(lambda x: x + (l - len(x)) * [0], batch)
+    return [x + (l - len(x)) * [0] for x in batch]
 
 def process_sig(sig):
     new_sig = ""
@@ -34,14 +34,12 @@ def process_sig(sig):
         if token[0].isalpha():
             new_sig += token.split(".")[-1] + " "
         else:
-            new_sig += token
+            new_sig += token + " "
     return new_sig.rstrip()
 
-def singleton_variable(token, batch_size, use_cuda):
+def singleton_variable(token, batch_size):
     if batch_size == 0:
-        var = Variable(torch.LongTensor([token]))
+        var = torch.tensor([token], dtype=torch.long, requires_grad=True)
     else:
-        var = Variable(torch.LongTensor(batch_size, 1).fill_(token))
-    if use_cuda:
-        var = var.cuda()
+        var = torch.full((batch_size, 1), token, dtype=torch.long, requires_grad=True)
     return var

@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 #import time
@@ -9,8 +8,7 @@ from utils import *
 from prepare_data import arrow_token, start_token, unk_token
 from type_signatures import Tree
 
-use_cuda = torch.cuda.is_available()
-#use_cuda = False
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class Encoder(nn.Module):
     def __init__(self, input_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
@@ -18,7 +16,7 @@ class Encoder(nn.Module):
         self.n_layers = n_layers
         self.hidden_size = hidden_size
         self.embedding = nn.Embedding(input_size, embed_size)
-        self.lstm = nn.LSTM(embed_size, hidden_size/2, num_layers=n_layers, batch_first=True, dropout=dropout_p, bidirectional=True)
+        self.lstm = nn.LSTM(embed_size, hidden_size//2, num_layers=n_layers, batch_first=True, dropout=dropout_p, bidirectional=True)
 
     '''
     input: B * T, sorted in decreasing length
@@ -34,8 +32,8 @@ class Encoder(nn.Module):
         return output, hidden
 
     def initHidden(self, batch_size):
-        hidden = (Variable(torch.zeros(2 * self.n_layers, batch_size, self.hidden_size/2)),
-                  Variable(torch.zeros(2 * self.n_layers, batch_size, self.hidden_size/2))
+        hidden = (torch.zeros(2 * self.n_layers, batch_size, self.hidden_size//2, requires_grad=True).to(device),
+                  torch.zeros(2 * self.n_layers, batch_size, self.hidden_size//2, requires_grad=True).to(device)
                   )
         return hidden
 
@@ -106,8 +104,8 @@ class AttnDecoder(nn.Module):
         return output, hidden
 
     def initHidden(self, batch_size):
-        hidden = (Variable(torch.zeros(1, batch_size, self.hidden_size)),
-                  Variable(torch.zeros(1, batch_size, self.hidden_size))
+        hidden = (torch.zeros(1, batch_size, self.hidden_size, requires_grad=True),
+                  torch.zeros(1, batch_size, self.hidden_size, requires_grad=True)
                   )
         return hidden
 
@@ -186,20 +184,15 @@ class ContextAttnDecoder(nn.Module):
         p_gen = p_gen.clone().masked_fill_(context_length == 0, 1)
 
         p_vocab = F.softmax(self.out(output.squeeze(1)), dim=1) # B * O
-        oov_var = Variable(torch.zeros(batch_size, self.max_oov))
-        if use_cuda:
-            oov_var = oov_var.cuda()
+        oov_var = torch.zeros(batch_size, self.max_oov, requires_grad=True).to(device)
         p_vocab = torch.cat((p_vocab, oov_var), 1)
 
         batch_indices = torch.arange(start=0, end=batch_size).long()
-        batch_indices = batch_indices.expand(context_input_len, batch_size).transpose(1, 0).contiguous().view(-1)
+        batch_indices = batch_indices.expand(context_input_len, batch_size).transpose(1, 0).contiguous().view(-1).to(device)
 
-        p_copy = Variable(torch.zeros(batch_size, self.vocab_size + self.max_oov))
-        if use_cuda:
-            p_copy = p_copy.cuda()
-            batch_indices = batch_indices.cuda()
+        p_copy = torch.zeros(batch_size, self.vocab_size + self.max_oov, requires_grad=True).to(device)
         word_indices = context_input.view(-1)
-        linearized_indices = Variable(batch_indices) * (self.vocab_size + self.max_oov) + word_indices
+        linearized_indices = batch_indices * (self.vocab_size + self.max_oov) + word_indices
         value_to_add = context_attn_scores.view(-1)
         p_copy.put_(linearized_indices, value_to_add, accumulate=True)
         output_prob = p_gen * p_vocab + (1 - p_gen) * p_copy
@@ -264,9 +257,9 @@ class Type(nn.Module):
         super(Type, self).__init__()
         self.num_modules = 2
         self.module_selector = nn.Sequential(
-                                    nn.Linear(hidden_size, hidden_size/2),
+                                    nn.Linear(hidden_size, hidden_size//2),
                                     nn.ReLU(),
-                                    nn.Linear(hidden_size/2, self.num_modules),
+                                    nn.Linear(hidden_size//2, self.num_modules),
                                     nn.LogSoftmax(dim=0)
                                    )
         self.embedding = nn.Embedding(vocab_size, embed_size)
@@ -292,11 +285,11 @@ class Type(nn.Module):
         embed = self.embedding(input).view(batch_size, input_len, -1)
         # assuming batch_size = 1 here, need to be changed later
         choice_probs = self.module_selector(parent_hidden[0].view(-1))
-        is_baseType = (choice_probs[0] > choice_probs[1]).data[0]
+        is_baseType = (choice_probs[0] > choice_probs[1]).item()
         if is_train:
             # compute topology loss
             target = 1 if reference.node == arrow_token else 0
-            target = singleton_variable(target, 0, use_cuda)
+            target = singleton_variable(target, 0).to(device)
             loss = self.topo_loss_factor * self.topo_crit(choice_probs.unsqueeze(0), target)
             is_baseType = reference.node != arrow_token
         else:
@@ -306,22 +299,22 @@ class Type(nn.Module):
             output, frat_hidden = self.base_module(embed, parent_hidden, frat_hidden, encoder_outputs)
             if rec_depth == 0:
                 # reach depth 0, can only generate type of kind *
-                _, indices = torch.topk(output.data[:, self.kind_zero], 1)
+                _, indices = torch.topk(output[:, self.kind_zero], 1)
                 # a hack here
-                data_constructor = torch.LongTensor(1, 1).fill_(self.kind_zero[indices[0][0]])
+                data_constructor = torch.full((1, 1), self.kind_zero[indices[0][0].item()], dtype=torch.long, requires_grad=True).to(device)
             else:
-                _, data_constructor = torch.topk(output.data[:, self.actual_token_pos:], 1)
+                _, data_constructor = torch.topk(output[:, self.actual_token_pos:], 1)
                 data_constructor = data_constructor + self.actual_token_pos
             if is_train:
                 constructor_token = reference.node if type(reference.node) is int else reference.node[0]
-                target = singleton_variable(constructor_token, 0, use_cuda)
+                target = singleton_variable(constructor_token, 0).to(device)
                 loss += self.crit(output, target)
                 kind = self.kind_dict[constructor_token]
-                data_constructor = singleton_variable(constructor_token, batch_size, use_cuda)
+                data_constructor = singleton_variable(constructor_token, batch_size).to(device)
             else:
-                kind = self.kind_dict[data_constructor[0][0]]
-                data_constructor = Variable(data_constructor)
-            results = [data_constructor.data[0][0]]
+                kind = self.kind_dict[data_constructor[0][0].item()]
+                # data_constructor.requires_grad_()
+            results = [data_constructor.data[0][0].item()]
             for i in range(kind):
                 if is_train:
                     if type(reference.node[i+1]) is int:
@@ -340,7 +333,7 @@ class Type(nn.Module):
             return Tree.singleton(results), parent_hidden, frat_hidden
         else:
             parent_hidden = self.arrow_module(embed, parent_hidden, frat_hidden, encoder_outputs)
-            arrow_tensor = singleton_variable(arrow_token, batch_size, use_cuda)
+            arrow_tensor = singleton_variable(arrow_token, batch_size).to(device)
             if is_train:
                 left_loss, _, frat_hidden = self(arrow_tensor, parent_hidden, frat_hidden, encoder_outputs, is_train, reference.left)
                 right_loss, _, frat_hidden = self(arrow_tensor, parent_hidden, frat_hidden, encoder_outputs, is_train, reference.right)
@@ -375,17 +368,13 @@ class Model(nn.Module):
         '''
         batch_size = input_seq.size(0)
         hidden = self.encoder.initHidden(batch_size)
-        if use_cuda:
-            hidden = (hidden[0].cuda(), hidden[1].cuda())
         encoder_outputs, encoder_hidden = self.encoder(input_seq, lengths, hidden)
         parent_hidden = (encoder_hidden[0].view(1, batch_size, -1),
                          encoder_hidden[1].view(1, batch_size, -1))
-        frat_hidden = (Variable(torch.zeros(1, batch_size, self.hidden_size)),
-                       Variable(torch.zeros(1, batch_size, self.hidden_size)))
-        decoder_in = Variable(torch.LongTensor(batch_size, 1).fill_(start_token))
-        if use_cuda:
-            frat_hidden = (frat_hidden[0].cuda(), frat_hidden[1].cuda())
-            decoder_in = decoder_in.cuda()
+        frat_hidden = (torch.zeros(1, batch_size, self.hidden_size, requires_grad=True).to(device),
+                       torch.zeros(1, batch_size, self.hidden_size, requires_grad=True).to(device)
+                       )
+        decoder_in = torch.full((batch_size, 1), start_token, dtype=torch.long, requires_grad=True).to(device)
         if is_train:
             loss, _, _ = self.decoder(decoder_in, parent_hidden, frat_hidden, encoder_outputs, is_train, reference)
             return loss
