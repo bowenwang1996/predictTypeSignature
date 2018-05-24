@@ -8,6 +8,7 @@ import random
 import argparse
 import copy
 import subprocess
+from shutil import copyfile
 
 from identifier_segmentor import segment
 from prepare_data import readSigTokens, prepareData, start_token, unk_token, arrow_token, prepareDataWithFileName
@@ -55,7 +56,8 @@ parser.add_argument("--topo_loss_factor", default=1.0, type=float)
 parser.add_argument("--num_epoch", default=50, type=int)
 parser.add_argument("--dump_result", default=0, type=int)
 parser.add_argument("--dev_result", default="results/dev_result.csv")
-
+parser.add_argument("--checkpoint_dir", default="./checkpoints/")
+parser.add_argument("--resume", default=None)
 
 def indexFromName(name, lang):
     tokens = []
@@ -69,7 +71,9 @@ def variableFromName(name, lang):
     var = torch.tensor(indices, dtype=torch.long, requires_grad=True).unsqueeze(0).to(device)
     return var
 
-def train(data, model, optimizer, dev_data=None, input_lang=None, output_lang=None):
+def train(data, model, optimizer,
+          epoch=0, checkpoint_base=0, dev_data=None,
+          input_lang=None, output_lang=None):
     epoch_loss = 0.0
     start = time.time()
     model.train()
@@ -79,12 +83,22 @@ def train(data, model, optimizer, dev_data=None, input_lang=None, output_lang=No
         input_len = input_variable.size(1)
         loss = model(input_variable, [input_len], is_train=True, reference=sig_tree)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), arg.grad_clip)
+        if arg.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), arg.grad_clip)
         optimizer.step()
         epoch_loss += loss.item()
         if (i + 1) % 10000 == 0:
-            print("checkpoint{} avg loss: {:.4f}".format((i+1)//10000, epoch_loss/(i+1)))
+            checkpoint_num = (i + 1) // 10000 + checkpoint_base
+            print("checkpoint{} avg loss: {:.4f}".format(checkpoint_num, epoch_loss/(i+1)))
             print("time since start: {}".format(timeSince(start)))
+            cur_checkpoint = arg.checkpoint_dir + "checkpoint{}-{}.pth".format(epoch, checkpoint_num)
+            torch.save({"epoch": epoch,
+                        "checkpoint": checkpoint_num,
+                        "model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "best_acc": best_accuracy
+                        }, cur_checkpoint)
+            copyfile(cur_checkpoint, arg.checkpoint_dir + "checkpoint.pth")
         if (i + 1) % 100000 == 0 and dev_data is not None:
             randomEval(dev_data, model, input_lang, output_lang)
             model.train()
@@ -97,8 +111,6 @@ def eval(data, input_vocab, output_vocab, model, is_test=False):
     num_correct = 0
     num_structural_correct = 0
     eval_loss = 0
-    # dev_output = "results/dev_output"
-    # subprocess.call("rm {}".format(dev_output), shell=True)
     for name, sig in data:
         input_variable = variableFromName(name, input_vocab)
         input_len = input_variable.size(1)
@@ -106,19 +118,12 @@ def eval(data, input_vocab, output_vocab, model, is_test=False):
         if not is_test:
             index_tree = copy.deepcopy(sig_tree).to_index(output_vocab.token_to_idx, unk_token)
             loss = model(input_variable, [input_len], is_train=True, reference=index_tree)
-            eval_loss += loss.data[0]
+            eval_loss += loss.item()
         gen_result = model(input_variable, [input_len])
         if gen_result.to_str(output_vocab.idx_to_token) == sig_tree:
             num_correct += 1
         if gen_result.structural_eq(sig_tree):
             num_structural_correct += 1
-        '''
-        with open(dev_output, "a+") as f:
-            f.write("name: {}\n".format(name))
-            f.write("sig: {}\n".format(sig))
-            f.write("prediction: {}\n".format(gen_result.to_sig()))
-            f.write("\n")
-        '''
     if not is_test:
         return eval_loss/len(data), float(num_correct)/len(data), float(num_structural_correct)/len(data)
     return float(num_correct)/len(data), float(num_structural_correct)/len(data)
@@ -188,12 +193,30 @@ def main(arg):
 
     best_accuracy = 0
     best_model = model.state_dict()
+    epoch_start = 0
+    checkpoint_num = 0
     print("Start training...")
-    for epoch in range(arg.num_epoch):
+    if arg.resume is not None:
+        print("loading from {}".format(arg.resume))
+        checkpoint = torch.load(arg.checkpoint_dir + arg.resume)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        best_accuracy = checkpoint["best_acc"]
+        epoch_start = checkpoint["epoch"]
+        checkpoint_num = checkpoint["checkpoint"]
+
+    for epoch in range(epoch_start, arg.num_epoch):
         try:
             epoch_loss = 0
             print("epoch {}/{}".format(epoch+1, arg.num_epoch))
-            epoch_loss = train(train_data, model, optimizer, dev_data=dev_data, input_lang=input_lang, output_lang=output_lang)
+            if checkpoint_num != 0:
+                epoch_loss = train(train_data[checkpoint_num*10000:], model, optimizer,
+                                   epoch=epoch, checkpoint_base=checkpoint_num,
+                                   dev_data=dev_data, input_lang=input_lang, output_lang=output_lang)
+            else:
+                epoch_loss = train(train_data, model, optimizer,
+                                   epoch=epoch, dev_data=dev_data,
+                                   input_lang=input_lang, output_lang=output_lang)
             print("train loss: {:.4f}".format(epoch_loss))
             dev_loss, accuracy, structural_acc = eval(dev_data, input_lang, output_lang, model)
             print("dev loss: {:.4f} accuracy: {:.4f} structural accuracy: {:.4f}".format(dev_loss, accuracy, structural_acc))
@@ -211,28 +234,7 @@ def main(arg):
     model.load_state_dict(torch.load(arg.model_state_file))
     accuracy, structural_acc = eval_test(test_data, input_lang, output_lang, model)
     print("test accuracy: {:.4f} structural accuracy: {:.4f}".format(accuracy, structural_acc))
-    '''
-    if dump:
-        import csv
-        dev_results = resultDump(dev_data, encoder, decoder, input_lang, output_lang)
-        test_results = resultDump(test_data, encoder, decoder, input_lang, output_lang)
-        def write_results(results, filename):
-            with open(filename, "w+") as csvfile:
-                writer = csv.writer(csvfile)
-                header = None
-                name = results[0][0]
-                if len(name) == 1:
-                    header = ["Name", "Signature"]
-                elif len(name) == 2:
-                    header = ["Module Name", "Name", "Signature"]
-                if header is not None:
-                    writer.writerow(header)
-                for name, sig in results:
-                    row = name + [sig]
-                    writer.writerow(row)
-        write_results(dev_results, arg.dev_result)
-        write_results(test_results, arg.test_results)
-    '''
+
 if __name__ == "__main__":
     arg = parser.parse_args()
     main(arg)
