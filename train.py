@@ -72,8 +72,8 @@ def variableFromName(name, lang):
     return var
 
 def train(data, model, optimizer,
-          epoch=0, checkpoint_base=0, dev_data=None,
-          input_lang=None, output_lang=None):
+          epoch=0, checkpoint_base=0, best_accuracy=0,
+          dev_data=None, input_lang=None, output_lang=None):
     epoch_loss = 0.0
     start = time.time()
     model.train()
@@ -211,11 +211,11 @@ def main(arg):
             print("epoch {}/{}".format(epoch+1, arg.num_epoch))
             if checkpoint_num != 0:
                 epoch_loss = train(train_data[checkpoint_num*10000:], model, optimizer,
-                                   epoch=epoch, checkpoint_base=checkpoint_num,
+                                   epoch=epoch, checkpoint_base=checkpoint_num, best_accuracy=best_accuracy,
                                    dev_data=dev_data, input_lang=input_lang, output_lang=output_lang)
             else:
                 epoch_loss = train(train_data, model, optimizer,
-                                   epoch=epoch, dev_data=dev_data,
+                                   epoch=epoch, dev_data=dev_data, best_accuracy=best_accuracy,
                                    input_lang=input_lang, output_lang=output_lang)
             print("train loss: {:.4f}".format(epoch_loss))
             dev_loss, accuracy, structural_acc = eval(dev_data, input_lang, output_lang, model)
