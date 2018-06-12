@@ -17,6 +17,7 @@ from utils import *
 from type_signatures import Tree
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+#device="cpu"
 parser = argparse.ArgumentParser(description="train model")
 
 parser.add_argument("--train_data", metavar="TRAIN DATA",
@@ -35,7 +36,7 @@ parser.add_argument("--use_qualified_name", default=1, type=int,
                     help="0 for not using qualified name, 1 for using qualified name"
                     )
 parser.add_argument("--use_full_path", default=0, type=int)
-
+parser.add_argument("--use_context", default=0, type=int)
 parser.add_argument("--train_data_qualified", metavar="QUALIFED TRAIN DATA",
                     default="data/new_data/train_simple_sigs_parsable_normalized.txt")
 
@@ -50,6 +51,7 @@ parser.add_argument("--batch_size", default=32, type=int)
 parser.add_argument("--eval_batch_size", default=8, type=int)
 parser.add_argument("--hidden_size", default=256, type=int)
 parser.add_argument("--embed_size", default=128, type=int)
+parser.add_argument("--lr", default=2e-4, type=float)
 parser.add_argument("--grad_clip", default=4.0, type=float)
 parser.add_argument("--rec_depth", default=6, type=int)
 parser.add_argument("--topo_loss_factor", default=1.0, type=float)
@@ -68,8 +70,56 @@ def indexFromName(name, lang):
 
 def variableFromName(name, lang):
     indices = indexFromName(name, lang)
-    var = torch.tensor(indices, dtype=torch.long, requires_grad=True).unsqueeze(0).to(device)
+    var = torch.tensor(indices, dtype=torch.long).unsqueeze(0).to(device)
     return var
+
+
+class ContextInfo():
+    '''
+    a class for holding context information (names and sigs)
+    '''
+
+    def __init__(self, input_vocab, target_vocab, names, sigs):
+        indices = [indexFromName(name, input_vocab) for name in names]
+        indices.sort(key=len, reverse=True)
+        max_len = len(indices[0])
+        lengths = [len(x) for x in indices]
+        indices = pad_to_len(indices, max_len)
+        name_var = torch.tensor(indices, dtype=torch.long).to(device)
+
+        sig_indices = []
+        sig_trees = []
+        oov_token_to_idx = {}
+        oov_idx_to_token = {}
+        oov_kind_dict = {}
+        for sig in sigs:
+            sig = process_sig(sig)
+            sig_tree = Tree.from_str(sig)\
+                           .to_index_augment(target_vocab.token_to_idx,
+                                             unk_token,
+                                             oov_token_to_idx,
+                                             oov_idx_to_token,
+                                             oov_kind_dict)
+            # this is cumbersome
+            sig_trees.append(sig_tree)
+            tree = Tree.from_str(sig)
+            tree.decorate()
+            node_map = tree.traversal(ignore_node="->")
+            for _, v in node_map.items():
+                if v in target_vocab.token_to_idx:
+                    sig_indices.append(target_vocab.token_to_idx[v])
+                else:
+                    assert(v in oov_token_to_idx)
+                    sig_indices.append(oov_token_to_idx[v])
+
+        self.names = name_var
+        self.name_lengths = lengths
+        self.sigs = sig_trees
+        self.indices = sig_indices
+        self.num = len(names)
+        self.oov_token_to_idx = oov_token_to_idx
+        self.oov_idx_to_token = oov_idx_to_token
+        self.oov_kind_dict = oov_kind_dict
 
 def train(data, model, optimizer,
           epoch=0, checkpoint_base=0, best_accuracy=0,
@@ -79,9 +129,9 @@ def train(data, model, optimizer,
     model.train()
     for i, datum in enumerate(data):
         optimizer.zero_grad()
-        input_variable, sig_tree = datum
+        input_variable, sig_tree, context_info = datum
         input_len = input_variable.size(1)
-        loss = model(input_variable, [input_len], is_train=True, reference=sig_tree)
+        loss = model(input_variable, [input_len], context_info, is_train=True, reference=sig_tree)
         loss.backward()
         if arg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), arg.grad_clip)
@@ -91,14 +141,13 @@ def train(data, model, optimizer,
             checkpoint_num = (i + 1) // 10000 + checkpoint_base
             print("checkpoint{} avg loss: {:.4f}".format(checkpoint_num, epoch_loss/(i+1)))
             print("time since start: {}".format(timeSince(start)))
-            cur_checkpoint = arg.checkpoint_dir + "checkpoint{}-{}.pth".format(epoch, checkpoint_num)
+            checkpoint_file = arg.checkpoint_dir + "checkpoint.pth"
             torch.save({"epoch": epoch,
                         "checkpoint": checkpoint_num,
                         "model_state": model.state_dict(),
                         "optimizer_state": optimizer.state_dict(),
                         "best_acc": best_accuracy
-                        }, cur_checkpoint)
-            copyfile(cur_checkpoint, arg.checkpoint_dir + "checkpoint.pth")
+                        }, checkpoint_file)
         if (i + 1) % 100000 == 0 and dev_data is not None:
             randomEval(dev_data, model, input_lang, output_lang)
             model.train()
@@ -111,19 +160,39 @@ def eval(data, input_vocab, output_vocab, model, is_test=False):
     num_correct = 0
     num_structural_correct = 0
     eval_loss = 0
-    for name, sig in data:
+    dev_output = "results/dev_output"
+    subprocess.call("rm {}".format(dev_output), shell=True)
+    for name, sig, context_names, context_sigs in data:
         input_variable = variableFromName(name, input_vocab)
         input_len = input_variable.size(1)
         sig_tree = Tree.from_str(process_sig(sig))
+        if context_names == []:
+            context_info = None
+        else:
+            context_info = ContextInfo(input_vocab, output_vocab, context_names, context_sigs)
         if not is_test:
-            index_tree = copy.deepcopy(sig_tree).to_index(output_vocab.token_to_idx, unk_token)
-            loss = model(input_variable, [input_len], is_train=True, reference=index_tree)
+            index_tree = copy.deepcopy(sig_tree)\
+                             .to_index(output_vocab.token_to_idx, unk_token)
+            loss = model(input_variable, [input_len], context_info,
+                         is_train=True, reference=index_tree)
             eval_loss += loss.item()
-        gen_result = model(input_variable, [input_len])
-        if gen_result.to_str(output_vocab.idx_to_token) == sig_tree:
+        gen_result = model(input_variable, [input_len], context_info)
+        if context_info:
+            gen_result.to_str(output_vocab.idx_to_token, oov_dict=context_info.oov_idx_to_token)
+        else:
+            gen_result.to_str(output_vocab.idx_to_token)
+        if gen_result == sig_tree:
             num_correct += 1
         if gen_result.structural_eq(sig_tree):
             num_structural_correct += 1
+        with open(dev_output, "a+") as f:
+            if context_info is not None:
+                for context_name, context_sig in zip(context_names, context_sigs):
+                    f.write("name: {} sig: {}\n".format(context_name, context_sig))
+            f.write("name: {}\n".format(name))
+            f.write("sig: {}\n".format(sig))
+            f.write("prediction: {}\n".format(gen_result.to_sig()))
+            f.write("\n")
     if not is_test:
         return eval_loss/len(data), float(num_correct)/len(data), float(num_structural_correct)/len(data)
     return float(num_correct)/len(data), float(num_structural_correct)/len(data)
@@ -131,51 +200,55 @@ def eval(data, input_vocab, output_vocab, model, is_test=False):
 def eval_test(data, input_lang, output_lang, model):
     return eval(data, input_lang, output_lang, model, is_test=True)
 
-def tokensToString(tokens, lang):
-    if tokens[-1] == end_token:
-        tokens = tokens[:-1]
-    s = ""
-    for token in tokens:
-        s += lang.idx_to_token[token] + " "
-    return s.rstrip()
-
 # data should be in original format (i.e. string)
 def randomEval(data, model, input_lang, output_lang):
     model.eval()
-    name, sig = random.choice(data)
+    name, sig, context_names, context_sigs = random.choice(data)
     input_variable = variableFromName(name, input_lang)
-    gen_result = model(input_variable, [input_variable.size(1)])
-    gen_result.to_str(output_lang.idx_to_token)
+    if context_names == []:
+        context_info = None
+    else:
+        context_info = ContextInfo(input_lang, output_lang, context_names, context_sigs)
+    gen_result = model(input_variable, [input_variable.size(1)], context_info)
+    if context_info:
+        gen_result.to_str(output_lang.idx_to_token, oov_dict=context_info.oov_idx_to_token)
+    else:
+        gen_result.to_str(output_lang.idx_to_token)
     predict_sig = gen_result.to_sig()
+    for context_name, context_sig in zip(context_names, context_sigs):
+        print("name: {} sig: {}".format(context_name, context_sig))
     print(name)
-    print(sig)
+    print(process_sig(sig))
     print(predict_sig)
 
-# data should be in original format (i.e. string)
-def resultDump(data, encoder, decoder, input_lang, output_lang):
-    results = []
-    for name, sig in data:
-        input_variable = variableFromName(name, input_lang)
-        input_lengths = [len(input_variable)]
-        target_indices = indexFromSignature(sig, output_lang)
-        decoded_tokens, eos_tensor = generate_step(input_variable.unsqueeze(0), input_lengths, encoder, decoder)
-        decoded_tokens = decoded_tokens.squeeze(0)[:eos_tensor[0]].tolist()
-        if decoded_tokens == target_indices:
-            results.append((name, sig))
-    return results
+def process_data(datum, input_vocab, target_vocab):
+    '''
+    a helper function for mapping raw data into processed data
+    '''
+    name, sig, context_names, context_sigs = datum
+    if context_names == []:
+        return (variableFromName(name, input_vocab),
+                Tree.from_str(sig).to_index(target_vocab.token_to_idx, unk_token),
+                None
+                )
+    return (variableFromName(name, input_vocab),
+            Tree.from_str(sig).to_index(target_vocab.token_to_idx, unk_token),
+            ContextInfo(input_vocab, target_vocab, context_names, context_sigs)
+            )
 
 def main(arg):
+    use_context = arg.use_context == 1
     if arg.use_qualified_name == 1:
         use_full_path = arg.use_full_path == 1
-        input_lang, output_lang, train_data = prepareDataWithFileName(arg.train_data_qualified, use_full_path)
-        _, _, dev_data = prepareDataWithFileName(arg.dev_data_qualified, use_full_path)
-        _, _, test_data = prepareDataWithFileName(arg.test_data_qualified, use_full_path)
+        input_lang, output_lang, train_data = prepareDataWithFileName(arg.train_data_qualified, use_full_path, use_context=use_context)
+        _, _, dev_data = prepareDataWithFileName(arg.dev_data_qualified, use_full_path, use_context=use_context)
+        _, _, test_data = prepareDataWithFileName(arg.test_data_qualified, use_full_path, use_context=use_context)
     else:
-        input_lang, output_lang, train_data = prepareData(arg.train_data)
-        _, _, dev_data = prepareData(arg.dev_data)
-        _, _, test_data = prepareData(arg.test_data)
+        input_lang, output_lang, train_data = prepareData(arg.train_data, use_context=use_context)
+        _, _, dev_data = prepareData(arg.dev_data, use_context=use_context)
+        _, _, test_data = prepareData(arg.test_data, use_context=use_context)
 
-    train_data = [(variableFromName(p[0], input_lang), Tree.from_str(p[1]).to_index(output_lang.token_to_idx, unk_token)) for p in train_data]
+    train_data = [process_data(d, input_lang, output_lang) for d in train_data]
 
     '''
     weight = [10 * math.sqrt(1.0/output_lang.token_to_count[output_lang.idx_to_token[x]])
@@ -183,13 +256,13 @@ def main(arg):
     weight = [0] * (arrow_token + 1) + weight
     loss_weight = torch.FloatTensor(weight)
     '''
-    # dump = arg.dump_result == 1
+
     model = Model(input_lang.n_word, output_lang.n_word, arg.embed_size,
                   arg.hidden_size, output_lang.kind_dict,
                   topo_loss_factor=arg.topo_loss_factor, rec_depth=arg.rec_depth,
                   weight=None)
     model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=2e-4)
+    optimizer = optim.Adam(model.parameters(), lr=arg.lr)
 
     best_accuracy = 0
     best_model = model.state_dict()
@@ -209,14 +282,10 @@ def main(arg):
         try:
             epoch_loss = 0
             print("epoch {}/{}".format(epoch+1, arg.num_epoch))
-            if checkpoint_num != 0:
-                epoch_loss = train(train_data[checkpoint_num*10000:], model, optimizer,
-                                   epoch=epoch, checkpoint_base=checkpoint_num, best_accuracy=best_accuracy,
-                                   dev_data=dev_data, input_lang=input_lang, output_lang=output_lang)
-            else:
-                epoch_loss = train(train_data, model, optimizer,
-                                   epoch=epoch, dev_data=dev_data, best_accuracy=best_accuracy,
-                                   input_lang=input_lang, output_lang=output_lang)
+            epoch_loss = train(train_data[checkpoint_num*10000:], model, optimizer,
+                               epoch=epoch, checkpoint_base=checkpoint_num, best_accuracy=best_accuracy,
+                               dev_data=dev_data, input_lang=input_lang, output_lang=output_lang)
+            checkpoint_num = 0
             print("train loss: {:.4f}".format(epoch_loss))
             dev_loss, accuracy, structural_acc = eval(dev_data, input_lang, output_lang, model)
             print("dev loss: {:.4f} accuracy: {:.4f} structural accuracy: {:.4f}".format(dev_loss, accuracy, structural_acc))

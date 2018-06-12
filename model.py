@@ -3,12 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-#import time
 from utils import *
 from prepare_data import arrow_token, start_token, unk_token
 from type_signatures import Tree
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+#device="cpu"
 
 class Encoder(nn.Module):
     def __init__(self, input_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
@@ -32,8 +32,8 @@ class Encoder(nn.Module):
         return output, hidden
 
     def initHidden(self, batch_size):
-        hidden = (torch.zeros(2 * self.n_layers, batch_size, self.hidden_size//2, requires_grad=True).to(device),
-                  torch.zeros(2 * self.n_layers, batch_size, self.hidden_size//2, requires_grad=True).to(device)
+        hidden = (torch.zeros(2 * self.n_layers, batch_size, self.hidden_size//2).to(device),
+                  torch.zeros(2 * self.n_layers, batch_size, self.hidden_size//2).to(device)
                   )
         return hidden
 
@@ -104,39 +104,35 @@ class AttnDecoder(nn.Module):
         return output, hidden
 
     def initHidden(self, batch_size):
-        hidden = (torch.zeros(1, batch_size, self.hidden_size, requires_grad=True),
-                  torch.zeros(1, batch_size, self.hidden_size, requires_grad=True)
+        hidden = (torch.zeros(1, batch_size, self.hidden_size),
+                  torch.zeros(1, batch_size, self.hidden_size)
                   )
         return hidden
 
 class Attn(nn.Module):
-    def __init__(self, hidden_size, use_coverage=False):
+    def __init__(self, input_size, hidden_size, output_size=None):
         super(Attn, self).__init__()
-        if use_coverage:
-            self.attn = nn.Linear(hidden_size, hidden_size + 1)
+        self.attn = nn.Linear(input_size, hidden_size)
+        if output_size:
+            self.attn_combine = nn.Linear(hidden_size * 2, output_size)
         else:
-            self.attn = nn.Linear(hidden_size, hidden_size)
-        self.attn_combine = nn.Linear(hidden_size * 2, hidden_size)
+            self.attn_combine = nn.Linear(hidden_size * 2, hidden_size)
 
-    def forward(self, decoder_out, encoder_outputs, coverage=None, score_only=False, context_only=False):
+    def forward(self, input, encoder_outputs, coverage=None, score_only=False, context_only=False):
         '''
-        decoder_out: B * 1 * H
+        input: B * 1 * L
         encoder_outputs: B * T * H
         returns: transformed decoder output and attention scores
         '''
-        decoder_out = self.attn(decoder_out)
-        if coverage is not None:
-            concat_tensor = torch.cat((encoder_outputs, coverage.unsqueeze(2)), 2)
-            attn_scores = torch.bmm(concat_tensor, decoder_out.transpose(1, 2))
-        else:
-            attn_scores = torch.bmm(encoder_outputs, decoder_out.transpose(1, 2))
+        input = self.attn(input)
+        attn_scores = torch.bmm(encoder_outputs, input.transpose(1, 2))
         attn_scores = F.softmax(attn_scores, dim=1).transpose(1, 2)
         if score_only:
             return attn_scores.squeeze(1)
         context = torch.bmm(attn_scores, encoder_outputs).squeeze(1) #B*H
         if context_only:
             return context
-        output = F.tanh(self.attn_combine(torch.cat((decoder_out.squeeze(1), context), 1)))
+        output = F.tanh(self.attn_combine(torch.cat((input.squeeze(1), context), 1)))
         return output
 
 # according to https://discuss.pytorch.org/t/does-nn-sigmoid-have-bias-parameter/10561/2
@@ -184,13 +180,13 @@ class ContextAttnDecoder(nn.Module):
         p_gen = p_gen.clone().masked_fill_(context_length == 0, 1)
 
         p_vocab = F.softmax(self.out(output.squeeze(1)), dim=1) # B * O
-        oov_var = torch.zeros(batch_size, self.max_oov, requires_grad=True).to(device)
+        oov_var = torch.zeros(batch_size, self.max_oov).to(device)
         p_vocab = torch.cat((p_vocab, oov_var), 1)
 
         batch_indices = torch.arange(start=0, end=batch_size).long()
         batch_indices = batch_indices.expand(context_input_len, batch_size).transpose(1, 0).contiguous().view(-1).to(device)
 
-        p_copy = torch.zeros(batch_size, self.vocab_size + self.max_oov, requires_grad=True).to(device)
+        p_copy = torch.zeros(batch_size, self.vocab_size + self.max_oov).to(device)
         word_indices = context_input.view(-1)
         linearized_indices = batch_indices * (self.vocab_size + self.max_oov) + word_indices
         value_to_add = context_attn_scores.view(-1)
@@ -206,45 +202,89 @@ class BaseType(nn.Module):
     def __init__(self, vocab_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
         super(BaseType, self).__init__()
         self.rnn = nn.LSTM(embed_size, hidden_size, num_layers=n_layers, dropout=dropout_p, batch_first=True)
-        self.parent_proj = nn.Linear(hidden_size, hidden_size)
-        self.frat_proj = nn.Linear(hidden_size, hidden_size)
-        self.attn = Attn(hidden_size)
+        #self.parent_proj = nn.Linear(hidden_size, hidden_size)
+        #self.frat_proj = nn.Linear(hidden_size, hidden_size)
+        self.attn = CopyAttn(hidden_size, hidden_size)
+        self.gen_prob = nn.Sequential(
+                            nn.Linear(3 * hidden_size + embed_size, 1),
+                            nn.Sigmoid()
+                            )
         self.out = nn.Linear(hidden_size, vocab_size)
+        self.vocab_size = vocab_size
 
-    def forward(self, input, parent_hidden, frat_hidden, encoder_outputs):
+    def forward(self, input, hidden, encoder_outputs, context_info, max_oov=20):
         '''
         input should already be embedded here (done in Type module)
         '''
-        hidden = (F.tanh(self.parent_proj(parent_hidden[0]) + self.frat_proj(frat_hidden[0])),
-                  F.tanh(self.parent_proj(parent_hidden[1]) + self.frat_proj(frat_hidden[1])))
+        # hidden = (F.tanh(self.parent_proj(parent_hidden[0]) + self.frat_proj(frat_hidden[0])),
+        #          F.tanh(self.parent_proj(parent_hidden[1]) + self.frat_proj(frat_hidden[1])))
         output, hidden = self.rnn(input, hidden)
-        output = self.attn(output, encoder_outputs)
-        output = self.out(output.squeeze(1))
-        output = F.log_softmax(output, dim=1)
-        return output, hidden
+        if context_info is not None:
+            cat_hidden = torch.cat((output,
+                                   context_info.name_hidden[0],
+                                   context_info.type_hidden[0],
+                                   input), 2)
+            gen_p = self.gen_prob(cat_hidden).view(-1)
+            oov_var = torch.zeros(max_oov).to(device)
+            output_prob = F.softmax(self.out(output).view(-1), dim=0)
+            p_vocab = torch.cat((output_prob, oov_var), 0)
+            context_attn_scores = self.attn(output, context_info.type_hiddens, score_only=True)
+            p_copy = torch.zeros(self.vocab_size + max_oov).to(device)
+            p_copy = p_copy.clone()
+            p_copy.put_(context_info.type_indices, context_attn_scores.view(-1), accumulate=True)
+            prob = gen_p * p_vocab + (1 - gen_p) * p_copy
+            return torch.log(prob.clamp(min=1e-10).unsqueeze(0)), hidden
+        else:
+            output = self.attn(output, encoder_outputs)
+            output = self.out(output.squeeze(1))
+            output = F.log_softmax(output, dim=1)
+            return output, hidden
 
 class ArrowType(nn.Module):
     '''
     submodule for handling arrow types
     '''
     def __init__(self, vocab_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
-        #self.arrow_embedding = nn.Parameter(torch.Tensor(embed_size))
-        #self.arrow_embedding.data.uniform_(-0.1, 0.1)
         super(ArrowType, self).__init__()
-        self.parent_proj = nn.Linear(hidden_size, hidden_size)
-        self.frat_proj = nn.Linear(hidden_size, hidden_size)
-        self.attn = Attn(hidden_size)
+        #self.parent_proj = nn.Linear(hidden_size, hidden_size)
+        #self.frat_proj = nn.Linear(hidden_size, hidden_size)
+        self.attn = Attn(embed_size, hidden_size, output_size=embed_size)
         self.rnn = nn.LSTM(embed_size, hidden_size, num_layers=n_layers, dropout=dropout_p, batch_first=True)
         self.out = nn.Linear(hidden_size, vocab_size)
 
-    def forward(self, input, parent_hidden, frat_hidden, encoder_outputs):
-        hidden = (F.tanh(self.parent_proj(parent_hidden[0]) + self.frat_proj(frat_hidden[0])),
-                  F.tanh(self.parent_proj(parent_hidden[1]) + self.frat_proj(frat_hidden[1])))
+    def forward(self, input, hidden, encoder_outputs):
+        # hidden = (F.tanh(self.parent_proj(parent_hidden[0]) + self.frat_proj(frat_hidden[0])),
+        #          F.tanh(self.parent_proj(parent_hidden[1]) + self.frat_proj(frat_hidden[1])))
+        input = self.attn(input, encoder_outputs).unsqueeze(0)
         output, hidden = self.rnn(input, hidden)
-        output = self.attn(output, encoder_outputs)
-        output = self.out(output.squeeze(1))
-        output = F.log_softmax(output, dim=1)
         return hidden
+
+class CopyAttn(nn.Module):
+    '''
+    attention for copying, separated from Attn for experiments
+    '''
+    def __init__(self, input_size, hidden_size, output_size=None):
+        super().__init__()
+        self.attn = nn.Linear(input_size, hidden_size)
+        if output_size:
+            self.attn_combine = nn.Linear(hidden_size * 2, output_size)
+        else:
+            self.attn_combine = nn.Linear(hidden_size * 2, hidden_size)
+
+    def forward(self, input, encoder_outputs, score_only=False):
+        '''
+        input: B * 1 * T
+        encoder_outputs: B * T * H
+        returns: normalized attention scores
+        '''
+        input = self.attn(input)
+        attn_scores = torch.bmm(encoder_outputs, input.transpose(1, 2))
+        attn_scores = F.softmax(attn_scores, dim=1).transpose(1, 2)
+        if score_only:
+            return attn_scores
+        context = torch.bmm(attn_scores, encoder_outputs).squeeze(1)  # B*H
+        output = F.tanh(self.attn_combine(torch.cat((input.squeeze(1), context), 1)))
+        return output
 
 class Type(nn.Module):
     '''
@@ -253,18 +293,22 @@ class Type(nn.Module):
     def __init__(self,
                  vocab_size, embed_size, hidden_size,
                  kind_dict, topo_loss_factor=1,
-                 n_layers=1, dropout_p=0.0, weight=None):
+                 n_layers=1, dropout_p=0.0, weight=None,
+                 max_oov=20):
         super(Type, self).__init__()
         self.num_modules = 2
         self.module_selector = nn.Sequential(
-                                    nn.Linear(hidden_size, hidden_size//2),
+                                    nn.Linear(hidden_size + embed_size, hidden_size),
                                     nn.ReLU(),
-                                    nn.Linear(hidden_size//2, self.num_modules),
+                                    nn.Linear(hidden_size, self.num_modules),
                                     nn.LogSoftmax(dim=0)
                                    )
         self.embedding = nn.Embedding(vocab_size, embed_size)
         self.base_module = BaseType(vocab_size, embed_size, hidden_size)
-        self.arrow_module = ArrowType(vocab_size, embed_size, hidden_size)
+        self.left_arrow_module = ArrowType(vocab_size, embed_size, hidden_size)
+        self.right_arrow_module = ArrowType(vocab_size, embed_size, hidden_size)
+        self.context_attn = CopyAttn(hidden_size, hidden_size)
+        self.hidden_combiner = Combiner(hidden_size, hidden_num=2)
         self.kind_dict = kind_dict
         self.kind_dict[unk_token] = 0
         self.kind_zero = [x for x in kind_dict if kind_dict[x] == 0]
@@ -272,8 +316,13 @@ class Type(nn.Module):
         self.topo_crit = nn.NLLLoss()
         self.crit = nn.NLLLoss(weight=weight)
         self.topo_loss_factor = topo_loss_factor
+        self.max_oov = max_oov
+        self.vocab_size = vocab_size
 
-    def forward(self, input, parent_hidden, frat_hidden, encoder_outputs,
+    def get_kind_zero(self, kind_dict):
+        return [x for x in kind_dict if kind_dict[x] == 0]
+
+    def forward(self, input, hidden, encoder_outputs, context_info,
                 is_train=False, reference=None, rec_depth=None,
                 wrap_result=True):
         '''
@@ -284,7 +333,7 @@ class Type(nn.Module):
         input_len = input.size(1)
         embed = self.embedding(input).view(batch_size, input_len, -1)
         # assuming batch_size = 1 here, need to be changed later
-        choice_probs = self.module_selector(parent_hidden[0].view(-1))
+        choice_probs = self.module_selector(torch.cat((hidden[0].view(-1), embed.view(-1))))
         is_baseType = (choice_probs[0] > choice_probs[1]).item()
         if is_train:
             # compute topology loss
@@ -296,53 +345,159 @@ class Type(nn.Module):
             if rec_depth == 0:
                 is_baseType = True
         if is_baseType:
-            output, frat_hidden = self.base_module(embed, parent_hidden, frat_hidden, encoder_outputs)
+            output, hidden = self.base_module(embed, hidden, encoder_outputs, context_info, max_oov=self.max_oov)
             if rec_depth == 0:
                 # reach depth 0, can only generate type of kind *
-                _, indices = torch.topk(output[:, self.kind_zero], 1)
+                if context_info is not None:
+                    oov_kind_zero = self.get_kind_zero(context_info.oov_kind_dict)
+                else:
+                    oov_kind_zero = []
+                kind_zero = self.kind_zero + oov_kind_zero
+                _, indices = torch.topk(output[:, kind_zero], 1)
                 # a hack here
-                data_constructor = torch.full((1, 1), self.kind_zero[indices[0][0].item()], dtype=torch.long, requires_grad=True).to(device)
+                data_constructor = torch.full((1, 1), kind_zero[indices[0][0].item()], dtype=torch.long).to(device)
             else:
                 _, data_constructor = torch.topk(output[:, self.actual_token_pos:], 1)
                 data_constructor = data_constructor + self.actual_token_pos
             if is_train:
-                constructor_token = reference.node if type(reference.node) is int else reference.node[0]
-                target = singleton_variable(constructor_token, 0).to(device)
+                token = reference.node if type(reference.node) is int else reference.node[0]
+                target = singleton_variable(token, 0).to(device)
                 loss += self.crit(output, target)
-                kind = self.kind_dict[constructor_token]
-                data_constructor = singleton_variable(constructor_token, batch_size).to(device)
+                kind = self.kind_dict[token]
+                data_constructor = singleton_variable(token, batch_size).to(device)
             else:
-                kind = self.kind_dict[data_constructor[0][0].item()]
-                # data_constructor.requires_grad_()
+                token = data_constructor[0][0].item()
+                if self.kind_dict.get(token) is not None:
+                    kind = self.kind_dict[token]
+                else:
+                    kind = context_info.oov_kind_dict[token]
             results = [data_constructor.data[0][0].item()]
             for i in range(kind):
+                if token >= self.vocab_size:
+                    data_constructor = singleton_variable(unk_token, 1).to(device)
                 if is_train:
                     if type(reference.node[i+1]) is int:
                         cur_reference = Tree(reference.node[i+1])
                     else:
                         cur_reference = reference.node[i+1]
-                    cur_loss, parent_hidden, frat_hidden = self(data_constructor, parent_hidden, frat_hidden, encoder_outputs, is_train, cur_reference)
+                    cur_loss, next_in, hidden = self(data_constructor, hidden, encoder_outputs, context_info, is_train, cur_reference)
+                    data_constructor = singleton_variable(next_in, 1).to(device)
                     loss += cur_loss
                 else:
-                    cur_result, parent_hidden, frat_hidden = self(data_constructor, parent_hidden, frat_hidden, encoder_outputs, rec_depth=rec_depth-1, wrap_result=False)
+                    cur_result, hidden = self(data_constructor, hidden, encoder_outputs, context_info, rec_depth=rec_depth-1, wrap_result=False)
+                    if isinstance(cur_result, Tree):
+                        next_in = cur_result.get_last()
+                    else:
+                        next_in = cur_result
+                    if next_in >= self.vocab_size:
+                        next_in = unk_token
+                    data_constructor = singleton_variable(next_in, 1).to(device)
                     results.append(cur_result)
             if is_train:
-                return loss, parent_hidden, frat_hidden
+                return loss, token, hidden
             if not wrap_result and len(results) == 1:
-                return results[0], parent_hidden, frat_hidden
-            return Tree.singleton(results), parent_hidden, frat_hidden
+                return results[0], hidden
+            return Tree.singleton(results), hidden
         else:
-            parent_hidden = self.arrow_module(embed, parent_hidden, frat_hidden, encoder_outputs)
+            left_hidden = self.left_arrow_module(embed, hidden, encoder_outputs)
+            #right_hidden = self.right_arrow_module(embed, hidden, encoder_outputs)
             arrow_tensor = singleton_variable(arrow_token, batch_size).to(device)
             if is_train:
-                left_loss, _, frat_hidden = self(arrow_tensor, parent_hidden, frat_hidden, encoder_outputs, is_train, reference.left)
-                right_loss, _, frat_hidden = self(arrow_tensor, parent_hidden, frat_hidden, encoder_outputs, is_train, reference.right)
+                left_loss, _, left_hidden = self(arrow_tensor, left_hidden, encoder_outputs, context_info, is_train, reference.left)
+                right_hidden = self.hidden_combiner(left_hidden, hidden)
+                right_loss, _, hidden = self(arrow_tensor, right_hidden, encoder_outputs, context_info, is_train, reference.right)
                 loss += left_loss + right_loss
-                return loss, parent_hidden, frat_hidden
+                return loss, reference.get_last(), hidden
             else:
-                left_result, _, frat_hidden = self(arrow_tensor, parent_hidden, frat_hidden, encoder_outputs, rec_depth=rec_depth-1)
-                right_result, _, frat_hidden = self(arrow_tensor, parent_hidden, frat_hidden, encoder_outputs, rec_depth=rec_depth-1)
-                return Tree.from_children(arrow_token, left_result, right_result), parent_hidden, frat_hidden
+                left_result, left_hidden = self(arrow_tensor, left_hidden, encoder_outputs, context_info, rec_depth=rec_depth-1)
+                right_hidden = self.hidden_combiner(left_hidden, hidden)
+                right_result, hidden = self(arrow_tensor, right_hidden, encoder_outputs, context_info, rec_depth=rec_depth-1)
+                return Tree.from_children(arrow_token, left_result, right_result), hidden
+
+class ContextType(nn.Module):
+
+    def __init__(self, vocab_size, embed_size, hidden_size,
+                 kind_dict, n_layers=1, dropout_p=0.0):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.rnn = nn.LSTM(embed_size, hidden_size,
+                           num_layers=n_layers, dropout=dropout_p,
+                           batch_first=True)
+        self.vocab_size = vocab_size
+
+    def forward_(self, input, hidden, hiddens):
+        if type(input.node) is int:
+            embedded = self.embedding(singleton_variable(input.node, 0).to(device))
+            output, hidden = self.rnn(embedded.view(1, 1, -1), hidden)
+            if input.node != arrow_token:
+                hiddens.append(output)
+        else:
+            assert(type(input.node) is list)
+            for item in input.node:
+                if type(item) is int:
+                    embedded = self.embedding(singleton_variable(item, 0).to(device))
+                    output, hidden = self.rnn(embedded.view(1, 1, -1), hidden)
+                    if item != arrow_token:
+                        hiddens.append(output)
+                else:
+                    self.forward_(item, hidden, hiddens)
+        if input.left is not None:
+            self.forward_(input.left, hidden, hiddens)
+        if input.right is not None:
+            _, hidden = self.forward_(input.right, hidden, hiddens)
+        return hiddens, hidden
+
+
+    def forward(self, input):
+        '''
+        input is the tree of indices for a type
+        '''
+        hidden = self.initHidden()
+        # node_map = input.traversal()
+        # node_num = len(node_map)
+        hiddens, last_hidden = self.forward_(input, hidden, [])
+        return hiddens, last_hidden
+
+    def initHidden(self):
+        hidden = (torch.zeros(1, 1, self.hidden_size).to(device),
+                  torch.zeros(1, 1, self.hidden_size).to(device)
+                  )
+        return hidden
+
+class Combiner(nn.Module):
+
+    def __init__(self, hidden_size, hidden_num=3):
+        super().__init__()
+        self.weight = nn.Linear(hidden_size * hidden_num, hidden_size)
+        '''
+        self.w_in = nn.Linear(hidden_size, hidden_size)
+        self.w_con_name = nn.Linear(hidden_size, hidden_size)
+        self.w_con_type = nn.Linear(hidden_size, hidden_size)
+        '''
+
+    def forward_(self, *args):
+        return F.tanh(self.weight(torch.cat(args, 2)))
+        # return F.tanh(self.w_in(h1) + self.w_con_name(h2) + self.w_con_type(h3))
+
+    def forward(self, *args):
+        hidden = (self.forward_(*[x[0] for x in args]),
+                  self.forward_(*[x[1] for x in args])
+                  )
+        return hidden
+
+class ContextInfo():
+    '''
+    a class for holding relevant context info to pass to decoder
+    '''
+
+    def __init__(self, name_hidden, type_hiddens, type_hidden, type_indices, oov_kind_dict):
+        assert(len(type_hiddens) == len(type_indices))
+        self.name_hidden = name_hidden
+        self.type_hiddens = torch.cat(type_hiddens, 1)
+        self.type_hidden = type_hidden
+        self.type_indices = torch.tensor(type_indices, dtype=torch.long).to(device)
+        self.oov_kind_dict = oov_kind_dict
 
 class Model(nn.Module):
     '''
@@ -360,24 +515,56 @@ class Model(nn.Module):
                                n_layers=n_layers, dropout_p=dropout_p)
         self.decoder = Type(target_vocab_size, embed_size, hidden_size,
                             kind_dict, n_layers, dropout_p, weight=weight)
+        self.context_type_encoder = ContextType(target_vocab_size, embed_size,
+                                                hidden_size, kind_dict,
+                                                n_layers, dropout_p)
+        self.context_name_encoder = Encoder(input_vocab_size, embed_size,
+                                            hidden_size, n_layers, dropout_p)
+        self.combiner = Combiner(hidden_size)
         self.rec_depth = rec_depth
 
-    def forward(self, input_seq, lengths, is_train=False, reference=None):
+    def forward(self, input_seq, lengths, context_info,
+                is_train=False, reference=None):
         '''
         input_seq: a sequence of tokens representing the names
         '''
+
+        # process input name
         batch_size = input_seq.size(0)
         hidden = self.encoder.initHidden(batch_size)
         encoder_outputs, encoder_hidden = self.encoder(input_seq, lengths, hidden)
-        parent_hidden = (encoder_hidden[0].view(1, batch_size, -1),
-                         encoder_hidden[1].view(1, batch_size, -1))
-        frat_hidden = (torch.zeros(1, batch_size, self.hidden_size, requires_grad=True).to(device),
-                       torch.zeros(1, batch_size, self.hidden_size, requires_grad=True).to(device)
-                       )
-        decoder_in = torch.full((batch_size, 1), start_token, dtype=torch.long, requires_grad=True).to(device)
+        hidden = (encoder_hidden[0].view(1, batch_size, -1),
+                  encoder_hidden[1].view(1, batch_size, -1))
+
+        if context_info is not None:
+            context_num = context_info.num
+
+            # process context names
+            context_name_hidden = self.context_name_encoder.initHidden(context_num)
+            context_name_encoder_outputs, context_name_hidden = self.context_name_encoder(context_info.names, context_info.name_lengths, context_name_hidden)
+            context_name_hidden = (context_name_hidden[0].view(context_num, 1, -1),
+                                   context_name_hidden[1].view(context_num, 1, -1))
+            context_name_hidden = ((context_name_hidden[0].sum(dim=0)/context_num).unsqueeze(0),
+                                   (context_name_hidden[1].sum(dim=0)/context_num).unsqueeze(0))
+
+            # process context types
+            context_type_hiddens = []
+            context_type_last_hiddens = []
+            for tree in context_info.sigs:
+                type_hiddens, type_hidden = self.context_type_encoder(tree)
+                context_type_hiddens += type_hiddens
+                context_type_last_hiddens.append(type_hidden)
+            context_type_hidden = (sum([x[0] for x in context_type_last_hiddens])/context_num,
+                                   sum([x[1] for x in context_type_last_hiddens])/context_num)
+
+            context_info = ContextInfo(context_name_hidden, context_type_hiddens,
+                                       context_type_hidden, context_info.indices,
+                                       context_info.oov_kind_dict)
+            hidden = self.combiner(hidden, context_name_hidden, context_type_hidden)
+        decoder_in = torch.full((batch_size, 1), start_token, dtype=torch.long).to(device)
         if is_train:
-            loss, _, _ = self.decoder(decoder_in, parent_hidden, frat_hidden, encoder_outputs, is_train, reference)
+            loss, _, _ = self.decoder(decoder_in, hidden, encoder_outputs, context_info, is_train, reference)
             return loss
         else:
-            results, _, _ = self.decoder(decoder_in, parent_hidden, frat_hidden, encoder_outputs, rec_depth=self.rec_depth)
+            results, _ = self.decoder(decoder_in, hidden, encoder_outputs, context_info, rec_depth=self.rec_depth)
             return results

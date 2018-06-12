@@ -162,14 +162,18 @@ def prepareDataWithFileName(filename, full_path=False, use_context=False, num_co
     data = []
     if use_context:
         context_sigs = []
+        context_names = []
         for line in lines:
             num, fname, dir_name, input_name, sig = processLineWithFileName(line, full_path)
             cur_context = context_sigs[-num_context_sig:]
-            sigs = [ p[2] for p in cur_context if p[0] == num or p[1] == dir_name]
+            cur_name_context = context_names[-num_context_sig:]
+            sigs = [p[2] for p in cur_context if p[0] == num]
+            names = [p[2] for p in cur_name_context if p[0] == num]
             name = fname + [input_name]
-            triple = (name, sig, [sigs])
-            data.append(triple)
+            datum = (name, sig, names, sigs)
+            data.append(datum)
             context_sigs.append([num, dir_name, sig])
+            context_names.append([num, dir_name, name])
             for ident in name:
                 input_lang.add_name(ident)
             output_lang.add_sig(sig)

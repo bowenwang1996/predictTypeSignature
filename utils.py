@@ -39,7 +39,7 @@ def process_sig(sig):
 
 def singleton_variable(token, batch_size):
     if batch_size == 0:
-        var = torch.tensor([token], dtype=torch.long, requires_grad=True)
+        var = torch.tensor([token], dtype=torch.long)
     else:
-        var = torch.full((batch_size, 1), token, dtype=torch.long, requires_grad=True)
+        var = torch.full((batch_size, 1), token, dtype=torch.long)
     return var

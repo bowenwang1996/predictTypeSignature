@@ -660,6 +660,9 @@ class Tree():
             return self.left.to_sig() + " -> " + self.right.to_sig()
 
     def decorate(self):
+        '''
+        decorate the nodes of the raw sig tree with their kinds
+        '''
         if type(self.node) is str and self.node != "->":
             self.node += "#0"
         elif type(self.node) is list:
@@ -687,18 +690,41 @@ class Tree():
             self.right.apply(func)
         return self
 
-    def to_index(self, dict, unk_token):
+    def to_index(self, dict, unk_token, oov_dict=None):
         self.decorate()
         def func(x):
             if x[0].isalpha():
                 x = x.split('.')[-1]
             if dict.get(x) is not None:
-                return dict.get(x)
+                return dict[x]
+            elif oov_dict is not None and oov_dict.get(x) is not None:
+                return oov_dict[x]
             return unk_token
         return self.apply(func)
 
-    def to_str(self, dict):
-        return self.apply(lambda x: dict[x].rsplit('#', 1)[0])
+    def to_index_augment(self, dict, unk_token,
+                         oov_token_to_idx, oov_idx_to_token, oov_kind_dict):
+        self.decorate()
+        def func(x):
+            if x[0].isalpha():
+                x = x.split('.')[-1]
+            if dict.get(x) is None:
+                cur_num = len(dict) + len(oov_token_to_idx)
+                oov_token_to_idx[x] = cur_num
+                oov_idx_to_token[cur_num] = x
+                kind = int(x.rsplit('#', 1)[-1])
+                oov_kind_dict[cur_num] = kind
+                return unk_token
+            return dict.get(x)
+        return self.apply(func)
+
+    def to_str(self, dict, oov_dict=None):
+        def func(x):
+            if dict.get(x) is None:
+                assert(oov_dict is not None)
+                return oov_dict[x].rsplit('#', 1)[0]
+            return dict[x].rsplit('#', 1)[0]
+        return self.apply(func)
 
     def __eq__(self, other):
         if isinstance(other, self.__class__):
@@ -713,7 +739,55 @@ class Tree():
             return left_flag and right_flag and self.node == other.node
         return False
 
+    def node_count(self):
+        count = 0
+        if type(self.node) is str or type(self.node) is int:
+            count += 1
+        else:
+            assert(type(self.node) is list)
+            for item in self.node:
+                if isinstance(item, self.__class__):
+                    count += item.node_count()
+                else:
+                    count += 1
+        if self.left is not None:
+            count += self.left.node_count()
+        if self.right is not None:
+            count += self.right.node_count()
+        return count
+
+    def traversal(self, dict=None, ignore_node=None):
+        node_map = {} if dict is None else dict
+        if type(self.node) is str or type(self.node) is int:
+            if self.node != ignore_node:
+                node_map[len(node_map)] = self.node
+        else:
+            assert(type(self.node) is list)
+            for item in self.node:
+                if isinstance(item, self.__class__):
+                    item.traversal(dict=node_map, ignore_node=ignore_node)
+                elif item != ignore_node:
+                    node_map[len(node_map)] = item
+        if self.left is not None:
+            self.left.traversal(dict=node_map, ignore_node=ignore_node)
+        if self.right is not None:
+            self.right.traversal(dict=node_map, ignore_node=ignore_node)
+        return node_map
+
+    def get_last(self):
+        if self.right is not None:
+            return self.right.get_last()
+        if type(self.node) is list:
+            if isinstance(self.node[-1], self.__class__):
+                return self.node[-1].get_last()
+            else:
+                return self.node[-1]
+        return self.node
+
     def strip(self):
+        '''
+        a helper function for structural comparison
+        '''
         self.node = ""
         if self.left is not None:
             self.left.strip()
@@ -741,6 +815,7 @@ print(sig_to_normalized_sexp(parse_sig("Maybe (Int -> Int) -> [Int] -> Either In
 
 tree = Tree.from_str("Maybe (IO a) -> [(Int, Int)] -> Either Int String")
 print(tree.to_sig())
+print(tree.traversal(ignore_node="->"))
 test_dict = {"->": 1, "Maybe#1": 2, "IO#1": 3, "a#0": 4, "[]#1": 5, "Int#0": 6, "Either#2": 7, "String#0": 8}
 test_dict1 = {1: "->", 2: "Maybe#1", 3: "IO#1", 4: "a#0", 5: "[]#1", 6: "Int#0", 7: "Either#2", 8: "String#0"}
 tree1 = Tree.from_str("Maybe (IO a) -> [Int] -> Either Int String")
