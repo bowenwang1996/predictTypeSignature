@@ -24,7 +24,7 @@ def timeSince(since):
 
 # pad each list in the batch to length l
 def pad_to_len(batch, l):
-    return map(lambda x: x + (l - len(x)) * [0], batch)
+    return list(map(lambda x: x + (l - len(x)) * [0], batch))
 
 def process_sig(sig):
     new_sig = ""
@@ -32,5 +32,5 @@ def process_sig(sig):
         if token[0].isalpha():
             new_sig += token.split(".")[-1] + " "
         else:
-            new_sig += token
+            new_sig += token + " "
     return new_sig.rstrip()

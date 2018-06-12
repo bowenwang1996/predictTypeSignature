@@ -33,7 +33,7 @@ class Batch():
 
     def batchify(self, data):
         data_len = len(data)
-        num_batches = data_len / self.batch_size
+        num_batches = data_len // self.batch_size
         batches = []
         for i in range(num_batches):
             batches.append(data[self.batch_size*i:self.batch_size*(i+1)])
@@ -43,7 +43,7 @@ class Batch():
         tokens = []
         for ident in name:
             tokens += identifier_segmentor.segment(ident)
-        indices = map(lambda x: self.input_vocab.lookup(x.lower()), tokens)
+        indices = [self.input_vocab.lookup(x.lower()) for x in tokens]
         indices.append(end_token)
         return indices
 
@@ -62,7 +62,7 @@ class Batch():
             else:
                 token = x
             return self.target_vocab.lookup(token)
-        indices = map(foo, tokens)
+        indices = [foo(x) for x in tokens]
         indices.append(end_token)
         return indices
 
@@ -75,7 +75,7 @@ class Batch():
 
     # unlike the method above, this method needs to take into account of oov words
     def indexFromSignatures(self, sigs, oov_idx_dict, idx_oov_dict):
-        tokens = sum(map(lambda x: x.split(), sigs), [])
+        tokens = sum(list(map(lambda x: x.split(), sigs)), [])
         indices = []
         for sig in sigs:
             tokens = sig.split()
@@ -104,15 +104,15 @@ class Batch():
         return var
 
     def variableFromBatch(self, batch):
-        input_target_batch = map(lambda p: (self.indexFromName(p[0]), self.indexFromSignature(p[1])), batch)
-        input_sort_index = get_sort_index(map(lambda p: len(p[0]), input_target_batch))
+        input_target_batch = list(map(lambda p: (self.indexFromName(p[0]), self.indexFromSignature(p[1])), batch))
+        input_sort_index = get_sort_index(list(map(lambda p: len(p[0]), input_target_batch)))
         input_target_batch = sorted(input_target_batch, key=lambda p:len(p[0]), reverse=True)
-        input_lengths = map(lambda p: len(p[0]), input_target_batch)
-        target_lengths = map(lambda p: len(p[1]), input_target_batch)
+        input_lengths = list(map(lambda p: len(p[0]), input_target_batch))
+        target_lengths = list(map(lambda p: len(p[1]), input_target_batch))
         max_input_len = max(input_lengths)
         max_target_len = max(target_lengths)
-        input_batch = map(lambda p: p[0] + (max_input_len - len(p[0])) * [0], input_target_batch)
-        target_batch = map(lambda p: p[1] + (max_target_len - len(p[1])) * [0], input_target_batch)
+        input_batch = list(map(lambda p: p[0] + (max_input_len - len(p[0])) * [0], input_target_batch))
+        target_batch = list(map(lambda p: p[1] + (max_target_len - len(p[1])) * [0], input_target_batch))
 
         input_batch = torch.LongTensor(input_batch)
         target_batch = torch.LongTensor(target_batch)
@@ -131,7 +131,7 @@ class Batch():
                 indices = self.indexFromSignatures(x[2], oov_idx_dict, idx_oov_dict)
                 context_batch.append(indices)
 
-            context_lengths = map(len, context_batch)
+            context_lengths = list(map(len, context_batch))
             max_context_len = max(context_lengths)
             context_batch = pad_to_len(context_batch, max_context_len)
             context_variable = Variable(torch.LongTensor(context_batch))

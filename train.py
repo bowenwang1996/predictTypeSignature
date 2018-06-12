@@ -64,7 +64,7 @@ def indexFromSignature(sig, lang):
         else:
             token = x
         return lang.lookup(token)
-    indices = map(foo, tokens)
+    indices = list(map(foo, tokens))
     indices.append(end_token)
     return indices
 
@@ -98,7 +98,7 @@ def indexFromName(name, lang):
     tokens = []
     for ident in name:
         tokens += segment(ident)
-    indices = map(lambda x: lang.lookup(x.lower()), tokens)
+    indices = list(map(lambda x: lang.lookup(x.lower()), tokens))
     indices.append(end_token)
     return indices
 
@@ -119,13 +119,13 @@ def batchify(data, batch_size):
 
 def variableFromBatch(batch, input_lang, output_lang):
     batch_size = len(batch)
-    batch = map(lambda p: (indexFromName(p[0], input_lang), indexFromSignature(p[1], output_lang)), batch)
+    batch = list(map(lambda p: (indexFromName(p[0], input_lang), indexFromSignature(p[1], output_lang)), batch))
     batch = sorted(batch, key=lambda p:len(p[0]), reverse=True)
     max_input_len = len(batch[0][0])
-    max_output_len = max(map(lambda p: len(p[1]), batch))
+    max_output_len = max(list(map(lambda p: len(p[1]), batch)))
     input_lengths = map(lambda p: len(p[0]), batch)
-    output_lengths = map(lambda p: len(p[1]), batch)
-    batch = map(lambda p: (p[0] + (max_input_len - len(p[0])) * [0], p[1] + (max_output_len - len(p[1])) * [0]), batch)
+    output_lengths = list(map(lambda p: len(p[1]), batch))
+    batch = list(map(lambda p: (p[0] + (max_input_len - len(p[0])) * [0], p[1] + (max_output_len - len(p[1])) * [0]), batch))
     input_batch = torch.LongTensor(batch_size, max_input_len)
     output_batch = torch.LongTensor(batch_size, max_output_len)
     for i in range(batch_size):
@@ -318,7 +318,7 @@ def main(arg):
         _, _, original_dev_data = prepareData(arg.dev_data)
         _, _, original_test_data = prepareData(arg.test_data)
 
-    train_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(train_data, arg.batch_size))
+    train_data = list(map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(train_data, arg.batch_size)))
     dev_data = batchify(original_dev_data, arg.eval_batch_size)
     #dev_data = map(lambda p: variableFromBatch(p, input_lang, output_lang), batchify(original_dev_data, arg.eval_batch_size))
 

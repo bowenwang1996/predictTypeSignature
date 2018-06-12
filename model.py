@@ -17,7 +17,7 @@ class Encoder(nn.Module):
         self.n_layers = n_layers
         self.hidden_size = hidden_size
         self.embedding = nn.Embedding(input_size, embed_size)
-        self.lstm = nn.LSTM(embed_size, hidden_size/2, num_layers=n_layers, batch_first=True, dropout=dropout_p, bidirectional=True)
+        self.lstm = nn.LSTM(embed_size, hidden_size//2, num_layers=n_layers, batch_first=True, dropout=dropout_p, bidirectional=True)
 
     '''
     input: B * T, sorted in decreasing length
@@ -33,8 +33,8 @@ class Encoder(nn.Module):
         return output, hidden
 
     def initHidden(self, batch_size):
-        hidden = (Variable(torch.zeros(2 * self.n_layers, batch_size, self.hidden_size/2)),
-                  Variable(torch.zeros(2 * self.n_layers, batch_size, self.hidden_size/2))
+        hidden = (Variable(torch.zeros(2 * self.n_layers, batch_size, self.hidden_size//2)),
+                  Variable(torch.zeros(2 * self.n_layers, batch_size, self.hidden_size//2))
                   )
         return hidden
 

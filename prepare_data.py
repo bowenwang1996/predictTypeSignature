@@ -120,7 +120,9 @@ def processLineWithFileName(line, full_path=False):
         filename[-1] = filename[-1].split('.')[0]
     else:
         filename = [path.split('/')[-1].split('.')[0]]
-    [name, sig] = name_and_sig.split('::', 1)
+    [name, rest] = name_and_sig.split(None, 1)
+    [colon, sig] = rest.split(None, 1)
+    assert(colon == "::")
     return int(num), filename, dir_name, name.strip(), sig.strip()
 
 # processes data with qualified name (full path to the file) and signatures

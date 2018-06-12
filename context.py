@@ -11,11 +11,15 @@ from prepare_data import start_token, end_token, unk_token, prepareData, readSig
 from model import *
 from batch import Batch, TrainInfo
 from beam import Beam
+from type_signatures import Tree
+from tensorboardX import SummaryWriter
 
 use_cuda = torch.cuda.is_available()
 #use_cuda = False
 
 parser = argparse.ArgumentParser(description="train model")
+exp_name = "baseline_copy"
+writer = SummaryWriter("/share/data/vision-greg/whc/bowen/experiments/{}/log_dir".format(exp_name))
 
 parser.add_argument("--train_data", metavar="TRAIN DATA",
                     default="data/train_simple_sigs_parsable_normalized.txt",
@@ -33,7 +37,7 @@ parser.add_argument("--type_token_data", metavar="TYPE TOKEN",
                     default="data/simple_types_vocab.txt"
                     )
 
-parser.add_argument("--use_qualified_name", default=0, type=int,
+parser.add_argument("--use_qualified_name", default=1, type=int,
                     help="0 for not using qualified name, 1 for using qualified name"
                     )
 parser.add_argument("--use_full_path", default=0, type=int)
@@ -59,16 +63,20 @@ parser.add_argument("--num_epoch", default=30, type=int)
 parser.add_argument("--dump_result", default=0, type=int)
 parser.add_argument("--dev_result", default="results/dev_result.csv")
 parser.add_argument("--test_results", default="results/test_result.csv")
-
+parser.add_argument("--resume")
+parser.add_argument("--checkpoint_dir")
 
 def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion, is_train):
     if is_train:
         encoder_optimizer.zero_grad()
+        context_encoder_optimizer.zero_grad()
         decoder_optimizer.zero_grad()
         encoder.train()
+        context_encoder.train()
         decoder.train()
     else:
         encoder.eval()
+        context_encoder.eval()
         decoder.eval()
 
     batch_size = batch.batch_size
@@ -139,7 +147,7 @@ def step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer,
         context_encoder_optimizer.step()
         decoder_optimizer.step()
 
-    return loss.data[0]/batch_size
+    return loss.item()/batch_size
 
 def train_step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion):
     return step(trainInfo, batch, encoder, context_encoder, decoder,
@@ -230,14 +238,29 @@ def generate_step(trainInfo, batch, encoder, context_encoder, decoder, max_lengt
         decoded_tokens.append(hyps[0])
     return decoded_tokens
 
-def train(data, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion):
+def train(data, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion, epoch=0, checkpoint_base=0, best_accuracy=0):
     epoch_loss = 0.0
     start = time.time()
     for i, trainInfo in enumerate(data):
+        if i < checkpoint_base * 1000:
+            continue
         epoch_loss += train_step(trainInfo, batch, encoder, context_encoder, decoder, encoder_optimizer, context_encoder_optimizer, decoder_optimizer, criterion)
         if (i+1) % 1000 == 0:
-            print("checkpoint{} avg loss: {:.4f}".format((i+1)/1000, epoch_loss/(i+1)))
+            checkpoint_num = (i+1) // 1000 + checkpoint_base
+            writer.add_scalar("avg loss", epoch_loss/(i+1), epoch * len(data)//1000 + checkpoint_num)
+            print("checkpoint{} avg loss: {:.4f}".format((i+1)//1000, epoch_loss/(i+1)))
             print("time since start: {}".format(timeSince(start)))
+            checkpoint_file = arg.checkpoint_dir + "checkpoint.pth"
+            torch.save({"epoch": epoch,
+                        "checkpoint": checkpoint_num,
+                        "encoder_state": encoder.state_dict(),
+                        "context_encoder_state": context_encoder.state_dict(),
+                        "decoder_state": decoder.state_dict(),
+                        "encoder_optimizer_state": encoder_optimizer.state_dict(),
+                        "context_encoder_optimizer_state": context_encoder_optimizer.state_dict(),
+                        "decoder_optimizer_state": decoder_optimizer.state_dict(),
+                        "best_acc": best_accuracy
+                    }, checkpoint_file)
     epoch_loss /= len(data)
     print("epoch total training time:{}".format(timeSince(start)))
     return epoch_loss
@@ -245,6 +268,7 @@ def train(data, batch, encoder, context_encoder, decoder, encoder_optimizer, con
 def eval(data, batch_object, encoder, context_encoder, decoder, criterion, is_test=False):
     data = batch_object.batchify(data)
     num_correct = 0
+    num_structural_correct = 0
     loss = 0
     data_len = len(data)
     batch_size = batch_object.batch_size
@@ -254,15 +278,25 @@ def eval(data, batch_object, encoder, context_encoder, decoder, criterion, is_te
         batch = sorted(batch, key=lambda p: len(batch_object.indexFromName(p[0])), reverse=True)
         for i in range(batch_size):
             _, sig, _ = batch[i]
-            predict_sig = tokensToString(decoded_tokens[i], batch_object.target_vocab, trainInfo.idx_oov_dict)
+            predict_sig = tokensToString([x.item() for x in decoded_tokens[i]], batch_object.target_vocab, trainInfo.idx_oov_dict)
             if predict_sig == process_sig(sig):
+                #print("correct prediction: {}".format(predict_sig))
                 num_correct += 1
+            try:
+                predict_tree = Tree.from_str(predict_sig)
+                actual_tree = Tree.from_str(process_sig(sig))
+                if predict_tree.structural_eq(actual_tree):
+                    num_structural_correct += 1
+            except ValueError:
+                pass
         if not is_test:
             loss += eval_step(trainInfo, batch_object, encoder, context_encoder, decoder, criterion)
+    print("number of correct predictions: {}".format(num_correct))
     accuracy = float(num_correct)/(data_len * batch_size)
+    structural_acc = num_structural_correct/(data_len * batch_size)
     if is_test:
-        return accuracy
-    return loss/data_len, accuracy
+        return accuracy, structural_acc
+    return loss/data_len, accuracy, structural_acc
 
 def eval_test(data, batch, encoder, context_encoder, decoder):
     return eval(data, batch, encoder, context_encoder, decoder, None, is_test=True)
@@ -285,7 +319,7 @@ def randomEval(data, batch, encoder, context_encoder, decoder):
     datum = random.choice(data)
     trainInfo = batch.variableFromBatch([datum])
     decoded_tokens = generate_step(trainInfo, batch, encoder, context_encoder, decoder)
-    decoded_token = decoded_tokens[0]
+    decoded_token = [x.item() for x in decoded_tokens[0]]
     predict_sig = tokensToString(decoded_token, batch.target_vocab, trainInfo.idx_oov_dict)
     print("Name:{}".format(datum[0]))
     print("Sig:{}".format(datum[1]))
@@ -310,7 +344,7 @@ def main(arg):
 
     batch_object = Batch(arg.batch_size, input_lang, output_lang, use_context=use_context)
 
-    train_data = map(lambda p: batch_object.variableFromBatch(p), batch_object.batchify(train_data))
+    train_data = list(map(lambda p: batch_object.variableFromBatch(p), batch_object.batchify(train_data)))
 
     encoder = Encoder(input_lang.n_word, arg.embed_size, arg.hidden_size)
     context_encoder = ContextEncoder(output_lang.n_word, arg.embed_size, arg.hidden_size)
@@ -333,16 +367,34 @@ def main(arg):
     best_accuracy = 0
     best_loss = float('inf')
     best_model = (encoder.state_dict(), context_encoder.state_dict(), decoder.state_dict())
+    epoch_start = 0
+    checkpoint_num = 0
     print("Start training...")
-    for epoch in range(arg.num_epoch):
-        try:
+    if arg.resume is not None:
+        print("loading from {}".format(arg.resume))
+        checkpoint = torch.load(arg.checkpoint_dir + arg.resume)
+        encoder.load_state_dict(checkpoint["encoder_state"])
+        context_encoder.load_state_dict(checkpoint["context_encoder_state"])
+        decoder.load_state_dict(checkpoint["decoder_state"])
+        encoder_optimizer.load_state_dict(checkpoint["encoder_optimizer_state"])
+        context_optimizer.load_state_dict(checkpoint["context_encoder_optimizer_state"])
+        decoder_optimizer.load_state_dict(checkpoint["decoder_optimizer_state"])
+        best_accuracy = checkpoint["best_acc"]
+        epoch_start = checkpoint["epoch"]
+        checkpoint_num = checkpoint["checkpoint"]
 
+    for epoch in range(epoch_start, arg.num_epoch):
+        try:
             print("epoch {}/{}".format(epoch+1, arg.num_epoch))
-            epoch_loss = train(train_data, batch_object, encoder, context_encoder, decoder, encoder_optimizer, context_optimizer, decoder_optimizer, criterion)
+            epoch_loss = train(train_data, batch_object, encoder, context_encoder, decoder, encoder_optimizer, context_optimizer, decoder_optimizer, criterion, epoch=epoch, checkpoint_base=checkpoint_num, best_accuracy=best_accuracy)
+            writer.add_scalar("Train loss", epoch_loss, epoch+1)
             print("train loss: {:.4f}".format(epoch_loss))
 
-            dev_loss, accuracy = eval(dev_data, batch_object, encoder, context_encoder, decoder, criterion)
-            print("dev loss: {:.4f} accuracy: {:.4f}".format(dev_loss, accuracy))
+            dev_loss, accuracy, structural_acc = eval(dev_data, batch_object, encoder, context_encoder, decoder, criterion)
+            writer.add_scalar("Dev loss", dev_loss, epoch+1)
+            writer.add_scalar("Dev acc", accuracy, epoch+1)
+            writer.add_scalar("Dev structural acc", structural_acc, epoch+1)
+            print("dev loss: {:.4f} accuracy: {:.4f} structural accuracy: {:.4f}".format(dev_loss, accuracy, structural_acc))
 
             encoder_optimizer_scheduler.step(dev_loss)
             context_optimizer_scheduler.step(dev_loss)
@@ -365,8 +417,10 @@ def main(arg):
     encoder.load_state_dict(torch.load(arg.encoder_state_file))
     context_encoder.load_state_dict(torch.load(arg.context_encoder_state_file))
     decoder.load_state_dict(torch.load(arg.decoder_state_file))
-    test_accuracy = eval_test(test_data, batch_object, encoder, context_encoder, decoder)
-    print("test accuracy: {:.4f}".format(test_accuracy))
+    test_accuracy, test_structural_acc = eval_test(test_data, batch_object, encoder, context_encoder, decoder)
+    writer.add_scalar("Test acc", test_accuracy)
+    writer.add_scalar("Test structural acc", test_structural_acc)
+    print("test accuracy: {:.4f} test structural accuracy: {:.4f}".format(test_accuracy, test_structural_acc))
 
 if __name__ == "__main__":
     arg = parser.parse_args()
