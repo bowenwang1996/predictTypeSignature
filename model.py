@@ -5,11 +5,12 @@ from torch.autograd import Variable
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from collections import Counter
 
-#import time
 from utils import *
+from batch import Batch
+from prepare_data import start_token, end_token
+from beam import Beam
 
 use_cuda = torch.cuda.is_available()
-#use_cuda = False
 
 class Encoder(nn.Module):
     def __init__(self, input_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
@@ -197,3 +198,130 @@ class ContextAttnDecoder(nn.Module):
         output_prob = p_gen * p_vocab + (1 - p_gen) * p_copy
 
         return torch.log(output_prob.clamp(min=1e-10)), hidden
+
+class Model(nn.Module):
+
+    def __init__(self, input_vocab, target_vocab, 
+                 embed_size, hidden_size, train_batch_size,
+                 eval_batch_size, criterion,
+                 n_layers=1, dropout_p=0.0):
+        super().__init__()
+        input_vocab_size = input_vocab.n_word
+        target_vocab_size = target_vocab.n_word
+        self.encoder = Encoder(input_vocab_size, embed_size, hidden_size,
+                               n_layers=n_layers, dropout_p=dropout_p)
+        self.decoder = ContextAttnDecoder(target_vocab_size, embed_size,
+                                          hidden_size, n_layers=n_layers,
+                                          dropout_p=dropout_p)
+        self.context_encoder = ContextEncoder(target_vocab_size, embed_size,
+                                              hidden_size, n_layers=n_layers,
+                                              dropout_p=dropout_p)
+        self.train_batch_size = train_batch_size
+        self.eval_batch_size = eval_batch_size
+        self.batch = Batch(train_batch_size, input_vocab, target_vocab)
+        self.criterion = criterion
+        self.combiner = nn.Linear(hidden_size * 2, hidden_size)
+
+    def combine(self, hidden1, hidden2):
+        combined = (F.tanh(self.combiner(torch.cat((hidden1[0], hidden2[0]), 2))),
+                    F.tanh(self.combiner(torch.cat((hidden1[1], hidden2[0]), 2)))
+                    )
+        return combined
+
+    def forward(self, trainInfo, is_dev=False, is_test=False, max_length=30):
+        batch_size = self.batch.batch_size
+        encoder_hidden = self.encoder.initHidden(batch_size)
+        context_encoder_hidden = self.context_encoder.initHidden(batch_size)
+        if use_cuda:
+            encoder_hidden = (encoder_hidden[0].cuda(), encoder_hidden[1].cuda())
+            context_encoder_hidden = (context_encoder_hidden[0].cuda(),
+                                      context_encoder_hidden[1].cuda()
+                                      )
+        target_len = trainInfo.target_variable.size(1)
+
+        encoder_outputs, encoder_hidden = self.encoder(trainInfo.input_variable,
+                                                       trainInfo.input_lengths,
+                                                       encoder_hidden)
+        context_variable = self.batch.unk_batch(trainInfo.context_variable)  # for feeding to context encoder
+        context_encoder_outputs, context_encoder_hidden = self.context_encoder(context_variable, trainInfo.context_lengths, trainInfo.context_sort_index, trainInfo.context_inv_index, context_encoder_hidden)
+
+        encoder_hidden = (encoder_hidden[0].view(1, batch_size, -1),
+                          encoder_hidden[1].view(1, batch_size, -1)
+                          )
+        context_encoder_hidden = (context_encoder_hidden[0].view(1, batch_size, -1),
+                                  context_encoder_hidden[1].view(1, batch_size, -1)
+                                  )
+        decoder_hidden = self.combine(encoder_hidden, context_encoder_hidden)
+        
+        if is_test or is_dev:
+            beam_size = 1
+            beams = [ Beam(beam_size,
+                           start_token,
+                           start_token,
+                           end_token,
+                           cuda=use_cuda)
+                      for _ in range(batch_size)
+                      ]
+            decoder_hiddens = [decoder_hidden for _ in range(beam_size)]
+            for i in range(max_length):
+                if all([b.done() for b in beams]):
+                    break
+                decoder_in = torch.cat([b.get_current_state() for b in beams], 0)\
+                                  .view(batch_size, -1)\
+                                  .transpose(0, 1)\
+                                  .unsqueeze(2)
+                decoder_in = Variable(self.batch.unk_batch(decoder_in))
+                word_probs = []
+                for j in range(beam_size):
+                    decoder_out, decoder_hidden = self.decoder(decoder_in[j],
+                                                               decoder_hiddens[j],
+                                                               encoder_outputs,
+                                                               context_encoder_outputs,
+                                                               trainInfo.context_variable)
+                    decoder_hiddens[j] = decoder_hidden
+                    word_probs.append(decoder_out)
+                word_probs = torch.cat(word_probs, 0).data
+                for j, b in enumerate(beams):
+                    b.advance(word_probs[j:beam_size*batch_size:batch_size, :])
+            decoded_tokens = []
+            for b in beams:
+                _, ks = b.sort_finished(minimum=b.n_best)
+                hyps = []
+                for i, (times, k) in enumerate(ks[:b.n_best]):
+                    hyp = b.get_hyp(times, k)
+                    hyps.append(hyp)
+                decoded_tokens.append(hyps[0])
+            if is_test:
+                return decoded_tokens
+        if is_dev or not is_test:
+            loss = 0.0
+            decoder_input = Variable(torch.LongTensor(batch_size, 1).fill_(start_token))
+            length_tensor = torch.LongTensor(trainInfo.target_lengths)
+            # at the begining, no sequence has ended so we use -1 as its end index
+            eos_tensor = torch.LongTensor(batch_size).fill_(-1)
+            if use_cuda:
+                decoder_input = decoder_input.cuda()
+                length_tensor = length_tensor.cuda()
+                eos_tensor = eos_tensor.cuda()
+
+            for i in range(target_len):
+                decoder_output, decoder_hidden = self.decoder(decoder_input,
+                                                              decoder_hidden,
+                                                              encoder_outputs,
+                                                              context_encoder_outputs,
+                                                              trainInfo.context_variable)
+                cur_loss = self.criterion(decoder_output, trainInfo.target_variable[:, i])
+                loss_mask = (length_tensor > i) & (eos_tensor == -1)
+                loss_mask = Variable(loss_mask).cuda() if use_cuda else Variable(loss_mask)
+                loss += torch.masked_select(cur_loss, loss_mask).sum()
+                _, topi = decoder_output.data.topk(1, dim=1)
+                next_in = self.batch.unk_batch(topi)
+                end_mask = next_in.squeeze(1) == end_token
+                end_mask = end_mask & (eos_tensor == -1)
+                eos_tensor.masked_fill_(end_mask, i)
+                decoder_input = Variable(next_in)
+                if use_cuda:
+                    decoder_input = decoder_input.cuda()
+            if not is_dev:
+                return loss
+            return loss, decoded_tokens

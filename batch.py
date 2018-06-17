@@ -31,6 +31,9 @@ class Batch():
         self.target_vocab = target_vocab
         self.use_context = use_context
 
+    def set_batch_size(self, batch_size):
+        self.batch_size = batch_size
+
     def batchify(self, data):
         data_len = len(data)
         num_batches = data_len // self.batch_size
