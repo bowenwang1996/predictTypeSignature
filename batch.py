@@ -12,15 +12,22 @@ class TrainInfo():
     '''
     this class is purely used to hold data. I don't want to rewrite a function that has 20 arguments
     '''
-    def __init__(self, input_var, input_lengths, target_var, target_lengths, context_var, context_lengths, oov_idx_dict, idx_oov_dict):
+    def __init__(self, input_var, input_lengths, target_var, target_lengths,
+                 context_name_var, context_name_lengths,
+                 context_sig_var, context_sig_lengths,
+                 oov_idx_dict, idx_oov_dict):
         self.input_variable = input_var
         self.input_lengths = input_lengths
         self.target_variable = target_var
         self.target_lengths = target_lengths
-        self.context_variable = context_var
-        self.context_lengths = sorted(context_lengths, reverse=True)
-        self.context_sort_index = get_sort_index(context_lengths)
-        self.context_inv_index = inv(self.context_sort_index)
+        self.context_name_variable = context_name_var
+        self.context_name_lengths = sorted(context_name_lengths, reverse=True)
+        self.context_sig_variable = context_sig_var
+        self.context_sig_lengths = sorted(context_sig_lengths, reverse=True)
+        self.context_name_sort_index = get_sort_index(context_name_lengths)
+        self.context_sig_sort_index = get_sort_index(context_sig_lengths)
+        self.context_name_inv_index = inv(self.context_name_sort_index)
+        self.context_sig_inv_index = inv(self.context_sig_sort_index)
         self.oov_idx_dict = oov_idx_dict
         self.idx_oov_dict = idx_oov_dict
 
@@ -49,6 +56,9 @@ class Batch():
         indices = [self.input_vocab.lookup(x.lower()) for x in tokens]
         indices.append(end_token)
         return indices
+
+    def indexFromNames(self, names):
+        return sum([self.indexFromName(name) for name in names])
 
     def variableFromName(self, name):
         indices = self.indexFromName(name)
@@ -129,25 +139,37 @@ class Batch():
         if self.use_context:
             oov_idx_dict = {}
             idx_oov_dict = {}
-            context_batch = []
+            context_sig_batch = []
+            context_name_batch = []
             for x in batch:
-                indices = self.indexFromSignatures(x[2], oov_idx_dict, idx_oov_dict)
-                context_batch.append(indices)
+                name_indices = self.indexFromNames(x[2])
+                sig_indices = self.indexFromSignatures(x[3], oov_idx_dict, idx_oov_dict)
+                context_name_batch.append(name_indices)
+                context_sig_batch.append(sig_indices)
 
-            context_lengths = list(map(len, context_batch))
-            max_context_len = max(context_lengths)
-            context_batch = pad_to_len(context_batch, max_context_len)
-            context_variable = Variable(torch.LongTensor(context_batch))
-            if use_cuda:
-                context_variable = context_variable.cuda()
-            context_variable = context_variable[input_sort_index]
-            context_lengths = [context_lengths[i] for i in input_sort_index]
+            def process_context_batch(batch):
+                lengths = [len(x) for x in batch]
+                max_len = max(lengths)
+                batch = pad_to_len(batch, max_len)
+                variable = torch.LongTensor(batch)
+                if use_cuda:
+                    variable = variable.cuda()
+                variable = variable[input_sort_index]
+                lengths = [lengths[i] for i in input_sort_index]
+                return batch, length
+
+            context_name_batch, context_name_lengths = process_context_batch(context_name_batch)
+            context_sig_batch, context_sig_lengths = process_context_batch(context_sig_batch)
             return TrainInfo(input_variable, input_lengths, target_variable, target_lengths, context_variable, context_lengths, oov_idx_dict, idx_oov_dict)
         return TrainInfo(input_variable, input_lengths, target_variable, target_lengths, None, None, None, None)
 
-    def unk_batch(self, batch):
+    def unk_batch(self, batch, is_input=False):
         # here batch is a B * seq_len tensor
 
-        vocab_batch = (batch < self.target_vocab.n_word).long()
-        unk_batch = (batch >= self.target_vocab.n_word).long()
+        if is_input:
+            vocab_batch = (batch < self.input_vocab.n_word).long()
+            unk_batch = (batch >= self.input_vocab.n_word).long()
+        else:
+            vocab_batch = (batch < self.target_vocab.n_word).long()
+            unk_batch = (batch >= self.target_vocab.n_word).long()
         return vocab_batch * batch + unk_batch * unk_token

@@ -60,13 +60,15 @@ parser.add_argument("--embed_size", default=128, type=int)
 parser.add_argument("--grad_clip", default=4.0, type=float)
 parser.add_argument("--num_epoch", default=30, type=int)
 parser.add_argument("--lr", default=3e-4, type=float)
+parser.add_argument("--context_num", default=3, type=int)
+parser.add_argument("--beam_size", default=1, type=int)
 parser.add_argument("--dump_result", default=0, type=int)
 parser.add_argument("--dev_result", default="results/dev_result.csv")
 parser.add_argument("--test_results", default="results/test_result.csv")
 parser.add_argument("--resume")
 parser.add_argument("--checkpoint_dir")
 
-def train(data, model, optimizer, epoch=0, checkpoint_base=0, best_accuracy=0):
+def train(data, model, optimizer, epoch=0, checkpoint_base=0, best_accuracy=0, writer=None, manager=None, arg=None, best_model=None):
     epoch_loss = 0.0
     start = time.time()
     model.train()
@@ -84,13 +86,14 @@ def train(data, model, optimizer, epoch=0, checkpoint_base=0, best_accuracy=0):
             writer.add_scalar("avg loss", epoch_loss/(i+1), epoch * 12 + checkpoint_num)
             print("checkpoint{} avg loss: {:.4f}".format(checkpoint_num, epoch_loss/(i+1)))
             print("time since start: {}".format(timeSince(start)))
-            checkpoint_file = arg.checkpoint_dir + "checkpoint.pth"
-            torch.save({"epoch": epoch,
-                        "checkpoint": checkpoint_num,
-                        "model_state": model.state_dict(),
-                        "optimizer_state": optimizer.state_dict(),
-                        "best_acc": best_accuracy
-                    }, checkpoint_file)
+            save_dict = {"epoch": epoch,
+                         "checkpoint": checkpoint_num,
+                         "model_state": model.state_dict(),
+                         "optimizer_state": optimizer.state_dict(),
+                         "best_acc": best_accuracy,
+                         "best_model": best_model
+                         }
+            manager.torch_save(save_dict)
     epoch_loss /= len(data)
     print("epoch total training time:{}".format(timeSince(start)))
     return epoch_loss
@@ -111,7 +114,7 @@ def eval(data, model, is_test=False):
         trainInfo = model.batch.variableFromBatch(batch)
         if not is_test:
             loss, decoded_tokens = model(trainInfo, is_dev=True)
-            eval_loss += loss.item()/model.eval_batch_size
+            eval_loss += loss.item()/batch_size
         else:
             decoded_tokens = model(trainInfo, is_test=True)
         batch = sorted(batch, key=lambda p: len(model.batch.indexFromName(p[0])), reverse=True)
@@ -132,7 +135,7 @@ def eval(data, model, is_test=False):
     structural_acc = num_structural_correct/(data_len * batch_size)
     if is_test:
         return accuracy, structural_acc
-    return loss/data_len, accuracy, structural_acc
+    return eval_loss/data_len, accuracy, structural_acc
 
 def eval_test(data, model):
     return eval(data, model, is_test=True)
@@ -165,10 +168,12 @@ def randomEval(data, model):
 
 def main(arg):
     use_context = arg.use_qualified_name == 1
+    if arg.context_num == 0:
+        use_context = False
     if use_context:
-        input_lang, output_lang, train_data = prepareDataWithFileName(arg.train_data_qualified, use_context=True)
-        _, _, dev_data = prepareDataWithFileName(arg.dev_data_qualified, use_context=True)
-        _, _, test_data = prepareDataWithFileName(arg.test_data_qualified, use_context=True)
+        input_lang, output_lang, train_data = prepareDataWithFileName(arg.train_data_qualified, use_context=True, num_context_sig=arg.context_num)
+        _, _, dev_data = prepareDataWithFileName(arg.dev_data_qualified, use_context=True, num_context_sig=arg.context_num)
+        _, _, test_data = prepareDataWithFileName(arg.test_data_qualified, use_context=True, num_context_sig=arg.context_num)
     else:
         input_lang, output_lang, train_data = prepareData(arg.train_data)
         _, _, dev_data = prepareData(arg.dev_data)
@@ -181,7 +186,8 @@ def main(arg):
 
     criterion = nn.NLLLoss(reduce=False)
     model = Model(input_lang, output_lang, arg.embed_size, arg.hidden_size,
-                  arg.batch_size, arg.eval_batch_size, criterion
+                  arg.batch_size, arg.eval_batch_size, criterion,
+                  beam_size=arg.beam_size
                   )
     if use_cuda:
         model = model.cuda()

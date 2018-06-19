@@ -13,11 +13,15 @@ from beam import Beam
 use_cuda = torch.cuda.is_available()
 
 class Encoder(nn.Module):
-    def __init__(self, input_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
+    def __init__(self, input_size, embed_size, hidden_size,
+                 n_layers=1, dropout_p=0.0, embedding=None):
         super(Encoder, self).__init__()
         self.n_layers = n_layers
         self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(input_size, embed_size)
+        if embedding is None:
+            self.embedding = nn.Embedding(input_size, embed_size)
+        else:
+            self.embedding = embedding
         self.lstm = nn.LSTM(embed_size, hidden_size//2, num_layers=n_layers, batch_first=True, dropout=dropout_p, bidirectional=True)
 
     '''
@@ -40,8 +44,10 @@ class Encoder(nn.Module):
         return hidden
 
 class ContextEncoder(Encoder):
-    def __init__(self, input_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
-        super(ContextEncoder, self).__init__(input_size, embed_size, hidden_size, n_layers, dropout_p)
+    def __init__(self, input_size, embed_size, hidden_size,
+                 n_layers=1, dropout_p=0.0, embedding=None):
+        super().__init__(input_size, embed_size, hidden_size,
+                         n_layers, dropout_p, embedding)
     def forward(self, input, lengths, sort_index, inv_sort_index, hidden):
         batch_size = input.size(0)
         input_len = input.size(1)
@@ -164,10 +170,11 @@ class ContextAttnDecoder(nn.Module):
         self.out = nn.Linear(hidden_size, vocab_size)
 
 
-    def forward(self, input, hidden, encoder_outputs, context_encoder_outputs, context_input):
+    def forward(self, input, hidden, encoder_outputs,
+                context_name_outputs, context_type_outputs, trainInfo):
         batch_size = input.size(0)
         input_len = input.size(1)
-        context_input_len = context_input.size(1)
+        context_input_len = trainInfo.context_type_variable.size(1)
         embedded = self.embedding(input).view(batch_size, input_len, -1) # B * 1 * H
         output, hidden = self.rnn(embedded, hidden)
         context = self.attn(output, encoder_outputs, context_only=True)
@@ -175,7 +182,7 @@ class ContextAttnDecoder(nn.Module):
         context_context = torch.bmm(context_attn_scores.unsqueeze(1), context_encoder_outputs).squeeze(1)
         p_gen = self.sigmoid(self.gen_prob(torch.cat((context, context_context, output.view(batch_size, -1), embedded.view(batch_size, -1)), 1)))
 
-        context_length = (context_input > 0).long().sum(1).unsqueeze(1)
+        context_length = (trainInfo.context_type_variable > 0).long().sum(1).unsqueeze(1)
         p_gen = p_gen.clone().masked_fill_(context_length == 0, 1)
 
         p_vocab = F.softmax(self.out(output.squeeze(1)), dim=1) # B * O
@@ -191,7 +198,7 @@ class ContextAttnDecoder(nn.Module):
         if use_cuda:
             p_copy = p_copy.cuda()
             batch_indices = batch_indices.cuda()
-        word_indices = context_input.view(-1)
+        word_indices = trainInfo.context_type_variable.view(-1)
         linearized_indices = Variable(batch_indices) * (self.vocab_size + self.max_oov) + word_indices
         value_to_add = context_attn_scores.view(-1)
         p_copy.put_(linearized_indices, value_to_add, accumulate=True)
@@ -204,57 +211,80 @@ class Model(nn.Module):
     def __init__(self, input_vocab, target_vocab, 
                  embed_size, hidden_size, train_batch_size,
                  eval_batch_size, criterion,
-                 n_layers=1, dropout_p=0.0):
+                 n_layers=1, dropout_p=0.0, beam_size=1):
         super().__init__()
         input_vocab_size = input_vocab.n_word
         target_vocab_size = target_vocab.n_word
+        self.input_embedding = nn.Embedding(input_vocab_size, embed_size)
         self.encoder = Encoder(input_vocab_size, embed_size, hidden_size,
-                               n_layers=n_layers, dropout_p=dropout_p)
+                               n_layers=n_layers, dropout_p=dropout_p,
+                               embedding=self.input_embedding)
         self.decoder = ContextAttnDecoder(target_vocab_size, embed_size,
                                           hidden_size, n_layers=n_layers,
                                           dropout_p=dropout_p)
-        self.context_encoder = ContextEncoder(target_vocab_size, embed_size,
-                                              hidden_size, n_layers=n_layers,
-                                              dropout_p=dropout_p)
+        self.context_name_encoder = ContextEncoder(input_vocab_size, embed_size,
+                                                   hidden_size, n_layers=n_layers,
+                                                   dropout_p=dropout_p,
+                                                   embedding=self.input_embedding)
+        self.context_type_encoder = ContextEncoder(target_vocab_size, embed_size,
+                                                   hidden_size, n_layers=n_layers,
+                                                   dropout_p=dropout_p)
         self.train_batch_size = train_batch_size
         self.eval_batch_size = eval_batch_size
         self.batch = Batch(train_batch_size, input_vocab, target_vocab)
         self.criterion = criterion
-        self.combiner = nn.Linear(hidden_size * 2, hidden_size)
+        self.combiner = nn.Linear(hidden_size * 3, hidden_size)
+        self.beam_size = beam_size
 
-    def combine(self, hidden1, hidden2):
-        combined = (F.tanh(self.combiner(torch.cat((hidden1[0], hidden2[0]), 2))),
-                    F.tanh(self.combiner(torch.cat((hidden1[1], hidden2[0]), 2)))
+    def combine(self, *args):
+        combined = (F.tanh(self.combiner(torch.cat([x[0] for x in args], 2))),
+                    F.tanh(self.combiner(torch.cat([x[1] for x in args], 2)))
                     )
         return combined
+
+    def set_beam_size(self, beam_size):
+        self.beam_size = beam_size
 
     def forward(self, trainInfo, is_dev=False, is_test=False, max_length=30):
         batch_size = self.batch.batch_size
         encoder_hidden = self.encoder.initHidden(batch_size)
-        context_encoder_hidden = self.context_encoder.initHidden(batch_size)
+        context_name_hidden = self.context_name_encoder.initHidden(batch_size)
+        context_type_hidden = self.context_type_encoder.initHidden(batch_size)
+        
         if use_cuda:
             encoder_hidden = (encoder_hidden[0].cuda(), encoder_hidden[1].cuda())
-            context_encoder_hidden = (context_encoder_hidden[0].cuda(),
-                                      context_encoder_hidden[1].cuda()
-                                      )
+            context_name_hidden = (context_name_hidden[0].cuda(),
+                                   context_name_hidden[1].cuda()
+                                   )
+            context_type_hidden = (context_type_hidden[0].cuda(),
+                                   context_type_hidden[0].cuda()
+                                   )
         target_len = trainInfo.target_variable.size(1)
 
         encoder_outputs, encoder_hidden = self.encoder(trainInfo.input_variable,
                                                        trainInfo.input_lengths,
                                                        encoder_hidden)
-        context_variable = self.batch.unk_batch(trainInfo.context_variable)  # for feeding to context encoder
-        context_encoder_outputs, context_encoder_hidden = self.context_encoder(context_variable, trainInfo.context_lengths, trainInfo.context_sort_index, trainInfo.context_inv_index, context_encoder_hidden)
+        context_name_variable = self.batch.unk_batch(trainInfo.context_name_variable,
+                                                     is_input=True)
+        cotnext_type_variable = self.batch.unk_batch(trainInfo.context_sig_variable,
+                                                     is_input=False)
+        context_name_outputs, context_name_hidden = self.context_name_encoder(context_name_variable, trainInfo.context_name_lengths, trainInfo.context_name_sort_index, trainInfo.context_name_inv_index, context_name_encoder_hidden)
+
+        context_type_outputs, context_type_hidden = self.context_type_encoder(context_type_variable, trainInfo.context_type_lengths, trainInfo.context_type_sort_index, trainInfo.context_type_inv_index, context_type_encoder_hidden)
 
         encoder_hidden = (encoder_hidden[0].view(1, batch_size, -1),
                           encoder_hidden[1].view(1, batch_size, -1)
                           )
-        context_encoder_hidden = (context_encoder_hidden[0].view(1, batch_size, -1),
-                                  context_encoder_hidden[1].view(1, batch_size, -1)
-                                  )
-        decoder_hidden = self.combine(encoder_hidden, context_encoder_hidden)
+        context_name_hidden = (context_name_hidden[0].view(1, batch_size, -1),
+                               context_name_hidden[1].view(1, batch_size, -1)
+                               )
+        context_type_hidden = (context_type_hidden[0].view(1, batch_size, -1),
+                               context_type_hidden[1].view(1, batch_size, -1)
+                               )
+        decoder_hidden = self.combine(encoder_hidden, context_name_hidden, context_type_hidden)
         
         if is_test or is_dev:
-            beam_size = 1
+            beam_size = self.beam_size
             beams = [ Beam(beam_size,
                            start_token,
                            start_token,
@@ -276,8 +306,9 @@ class Model(nn.Module):
                     decoder_out, decoder_hidden = self.decoder(decoder_in[j],
                                                                decoder_hiddens[j],
                                                                encoder_outputs,
-                                                               context_encoder_outputs,
-                                                               trainInfo.context_variable)
+                                                               context_name_outputs,
+                                                               context_type_outputs,
+                                                               trainInfo)
                     decoder_hiddens[j] = decoder_hidden
                     word_probs.append(decoder_out)
                 word_probs = torch.cat(word_probs, 0).data
@@ -308,8 +339,9 @@ class Model(nn.Module):
                 decoder_output, decoder_hidden = self.decoder(decoder_input,
                                                               decoder_hidden,
                                                               encoder_outputs,
-                                                              context_encoder_outputs,
-                                                              trainInfo.context_variable)
+                                                              context_name_outputs,
+                                                              context_type_outputs,
+                                                              trainInfo)
                 cur_loss = self.criterion(decoder_output, trainInfo.target_variable[:, i])
                 loss_mask = (length_tensor > i) & (eos_tensor == -1)
                 loss_mask = Variable(loss_mask).cuda() if use_cuda else Variable(loss_mask)
