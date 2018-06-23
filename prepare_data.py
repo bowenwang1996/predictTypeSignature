@@ -185,5 +185,5 @@ def prepareDataWithFileName(filename, full_path=False, use_context=False, num_co
                 input_lang.add_name(ident)
             output_lang.add_sig(sig)
             data.append((name, sig))
-    random.shuffle(data)
+    #random.shuffle(data)
     return input_lang, output_lang, data

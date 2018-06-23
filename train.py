@@ -12,12 +12,12 @@ from shutil import copyfile
 
 from identifier_segmentor import segment
 from prepare_data import readSigTokens, prepareData, start_token, unk_token, arrow_token, prepareDataWithFileName
-from model import Encoder, Decoder, AttnDecoder, Model
+from model import Model
 from utils import *
 from type_signatures import Tree
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-#device="cpu"
+
 parser = argparse.ArgumentParser(description="train model")
 
 parser.add_argument("--train_data", metavar="TRAIN DATA",
@@ -54,6 +54,7 @@ parser.add_argument("--embed_size", default=128, type=int)
 parser.add_argument("--lr", default=2e-4, type=float)
 parser.add_argument("--grad_clip", default=4.0, type=float)
 parser.add_argument("--rec_depth", default=6, type=int)
+parser.add_argument("--dropout", default=0.0, type=float)
 parser.add_argument("--topo_loss_factor", default=1.0, type=float)
 parser.add_argument("--num_epoch", default=50, type=int)
 parser.add_argument("--dump_result", default=0, type=int)
@@ -81,18 +82,15 @@ class ContextInfo():
 
     def __init__(self, input_vocab, target_vocab, names, sigs):
         indices = [indexFromName(name, input_vocab) for name in names]
-        indices.sort(key=len, reverse=True)
-        max_len = len(indices[0])
-        lengths = [len(x) for x in indices]
-        indices = pad_to_len(indices, max_len)
-        name_var = torch.tensor(indices, dtype=torch.long).to(device)
+        name_vars = [torch.LongTensor(x).to(device) for x in indices]
 
-        sig_indices = []
+        sigs_indices = []
         sig_trees = []
         oov_token_to_idx = {}
         oov_idx_to_token = {}
         oov_kind_dict = {}
         for sig in sigs:
+            sig_indices = []
             sig = process_sig(sig)
             sig_tree = Tree.from_str(sig)\
                            .to_index_augment(target_vocab.token_to_idx,
@@ -111,11 +109,11 @@ class ContextInfo():
                 else:
                     assert(v in oov_token_to_idx)
                     sig_indices.append(oov_token_to_idx[v])
+            sigs_indices.append(torch.tensor(sig_indices, dtype=torch.long).to(device))
 
-        self.names = name_var
-        self.name_lengths = lengths
+        self.names = name_vars
         self.sigs = sig_trees
-        self.indices = sig_indices
+        self.indices = sigs_indices
         self.num = len(names)
         self.oov_token_to_idx = oov_token_to_idx
         self.oov_idx_to_token = oov_idx_to_token
@@ -155,13 +153,14 @@ def train(data, model, optimizer,
     print("epoch total training time: {}".format(timeSince(start)))
     return epoch_loss
 
-def eval(data, input_vocab, output_vocab, model, is_test=False):
+def eval(data, input_vocab, output_vocab, model, is_test=False, write_output=False):
     model.eval()
     num_correct = 0
     num_structural_correct = 0
     eval_loss = 0
-    dev_output = "results/dev_output"
-    subprocess.call("rm {}".format(dev_output), shell=True)
+    if write_output:
+        dev_output = "results/dev_output"
+        subprocess.call("rm {}".format(dev_output), shell=True)
     for name, sig, context_names, context_sigs in data:
         input_variable = variableFromName(name, input_vocab)
         input_len = input_variable.size(1)
@@ -185,14 +184,15 @@ def eval(data, input_vocab, output_vocab, model, is_test=False):
             num_correct += 1
         if gen_result.structural_eq(sig_tree):
             num_structural_correct += 1
-        with open(dev_output, "a+") as f:
-            if context_info is not None:
-                for context_name, context_sig in zip(context_names, context_sigs):
-                    f.write("name: {} sig: {}\n".format(context_name, context_sig))
-            f.write("name: {}\n".format(name))
-            f.write("sig: {}\n".format(sig))
-            f.write("prediction: {}\n".format(gen_result.to_sig()))
-            f.write("\n")
+        if write_output:
+            with open(dev_output, "a+") as f:
+                if context_info is not None:
+                    for context_name, context_sig in zip(context_names, context_sigs):
+                        f.write("name: {} sig: {}\n".format(context_name, context_sig))
+                        f.write("name: {}\n".format(name))
+                        f.write("sig: {}\n".format(sig))
+                        f.write("prediction: {}\n".format(gen_result.to_sig()))
+                        f.write("\n")
     if not is_test:
         return eval_loss/len(data), float(num_correct)/len(data), float(num_structural_correct)/len(data)
     return float(num_correct)/len(data), float(num_structural_correct)/len(data)
@@ -258,7 +258,7 @@ def main(arg):
     '''
 
     model = Model(input_lang.n_word, output_lang.n_word, arg.embed_size,
-                  arg.hidden_size, output_lang.kind_dict,
+                  arg.hidden_size, output_lang.kind_dict, dropout_p=arg.dropout,
                   topo_loss_factor=arg.topo_loss_factor, rec_depth=arg.rec_depth,
                   weight=None)
     model = model.to(device)

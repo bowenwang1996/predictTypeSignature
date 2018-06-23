@@ -8,14 +8,17 @@ from prepare_data import arrow_token, start_token, unk_token
 from type_signatures import Tree
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-#device="cpu"
 
 class Encoder(nn.Module):
-    def __init__(self, input_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
+    def __init__(self, input_size, embed_size, hidden_size,
+                 n_layers=1, dropout_p=0.0, embedding=None):
         super(Encoder, self).__init__()
         self.n_layers = n_layers
         self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(input_size, embed_size)
+        if embedding is None:
+            self.embedding = nn.Embedding(input_size, embed_size)
+        else:
+            self.embedding = embedding
         self.lstm = nn.LSTM(embed_size, hidden_size//2, num_layers=n_layers, batch_first=True, dropout=dropout_p, bidirectional=True)
 
     '''
@@ -38,8 +41,11 @@ class Encoder(nn.Module):
         return hidden
 
 class ContextEncoder(Encoder):
-    def __init__(self, input_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
-        super(ContextEncoder, self).__init__(input_size, embed_size, hidden_size, n_layers, dropout_p)
+    def __init__(self, input_size, embed_size, hidden_size,
+                 n_layers=1, dropout_p=0.0, embedding=None):
+        super().__init__(input_size, embed_size, hidden_size,
+                         n_layers, dropout_p, embedding)
+        
     def forward(self, input, lengths, sort_index, inv_sort_index, hidden):
         batch_size = input.size(0)
         input_len = input.size(1)
@@ -48,66 +54,7 @@ class ContextEncoder(Encoder):
         output, hidden = self.lstm(output, hidden)
         output, _ = pad_packed_sequence(output, batch_first=True)
         return output[inv_sort_index], hidden
-
-class Decoder(nn.Module):
-    def __init__(self, output_size, embed_size, hidden_size, n_layers=1):
-        super(Decoder, self).__init__()
-        self.n_layers = n_layers
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(output_size, embed_size)
-        self.rnn = nn.LSTM(embed_size, hidden_size)
-        self.out = nn.Linear(hidden_size, output_size)
-
-    def forward(self, input, hidden):
-        input_len = input.size()[0]
-        embedded = self.embedding(input).view(input_len, 1, -1)
-        output = embedded
-        for i in range(self.n_layers):
-            output, hidden = self.rnn(embedded, hidden)
-        output = F.log_softmax(self.out(output[0]), dim=1)
-        return output, hidden
-
-class AttnDecoder(nn.Module):
-    def __init__(self, output_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
-        super(AttnDecoder, self).__init__()
-        self.n_layers = n_layers
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(output_size, embed_size)
-        self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=True, num_layers=n_layers)
-        self.dropout_p = dropout_p
-        self.dropout = nn.Dropout(dropout_p)
-        self.attn = Attn(hidden_size)
-        self.out = nn.Linear(hidden_size, output_size)
-
-    def forward(self, input, hidden, encoder_outputs):
-        '''
-        input : B * T (T should be 1 since we use an outer loop to process target)
-        encoder_outputs: B * T * H
-        '''
-
-        input_len = input.size(1)
-        batch_size = input.size(0)
-        embedded = self.embedding(input).view(batch_size, input_len, -1)
-        '''
-        transformed_input = self.attn(embedded.view(batch_size, -1))
-        attn_scores = torch.bmm(encoder_outputs, transformed_input.unsqueeze(2)) # B*T*1
-        attn_scores = F.softmax(attn_scores, dim=1).transpose(1, 2)
-        context = torch.bmm(attn_scores, encoder_outputs).squeeze(1)
-        '''
-        output, hidden = self.lstm(embedded, hidden)
-        output = self.attn(output, encoder_outputs)
-        '''
-        output = self.attn_combine(torch.cat((output.view(batch_size, -1), context), 1))
-        output = F.tanh(output) #B*H
-        '''
-        output = F.log_softmax(self.out(output), dim=1)
-        return output, hidden
-
-    def initHidden(self, batch_size):
-        hidden = (torch.zeros(1, batch_size, self.hidden_size),
-                  torch.zeros(1, batch_size, self.hidden_size)
-                  )
-        return hidden
+                                                                                
 
 class Attn(nn.Module):
     def __init__(self, input_size, hidden_size, output_size=None):
@@ -147,77 +94,43 @@ class SigmoidBias(nn.Module):
         output = F.sigmoid(output)
         return output
 
-class ContextAttnDecoder(nn.Module):
-    def __init__(self, vocab_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0, max_oov=50):
-        super(ContextAttnDecoder, self).__init__()
-        self.n_layers = n_layers
-        self.hidden_size = hidden_size
-        self.vocab_size = vocab_size
-        self.max_oov = max_oov
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.rnn = nn.LSTM(embed_size, hidden_size, batch_first=True, num_layers=n_layers)
-        self.attn = Attn(hidden_size)
-        self.context_attn = Attn(hidden_size, use_coverage=True)
-        self.gen_prob = nn.Linear(3 * hidden_size + embed_size, 1)
-        self.sigmoid = SigmoidBias(1)
-        self.dropout_p = dropout_p
-        self.dropout = nn.Dropout(dropout_p)
-        self.out = nn.Linear(hidden_size, vocab_size)
-
-
-    def forward(self, input, hidden, encoder_outputs, context_encoder_outputs, context_input, coverage):
-        batch_size = input.size(0)
-        input_len = input.size(1)
-        context_input_len = context_input.size(1)
-        embedded = self.embedding(input).view(batch_size, input_len, -1) # B * 1 * H
-        output, hidden = self.rnn(embedded, hidden)
-        context = self.attn(output, encoder_outputs, context_only=True)
-        context_attn_scores = self.context_attn(output, context_encoder_outputs, coverage=coverage, score_only=True)
-        context_context = torch.bmm(context_attn_scores.unsqueeze(1), context_encoder_outputs).squeeze(1)
-        p_gen = self.sigmoid(self.gen_prob(torch.cat((context, context_context, output.view(batch_size, -1), embedded.view(batch_size, -1)), 1)))
-
-        context_length = (context_input > 0).long().sum(1).unsqueeze(1)
-        p_gen = p_gen.clone().masked_fill_(context_length == 0, 1)
-
-        p_vocab = F.softmax(self.out(output.squeeze(1)), dim=1) # B * O
-        oov_var = torch.zeros(batch_size, self.max_oov).to(device)
-        p_vocab = torch.cat((p_vocab, oov_var), 1)
-
-        batch_indices = torch.arange(start=0, end=batch_size).long()
-        batch_indices = batch_indices.expand(context_input_len, batch_size).transpose(1, 0).contiguous().view(-1).to(device)
-
-        p_copy = torch.zeros(batch_size, self.vocab_size + self.max_oov).to(device)
-        word_indices = context_input.view(-1)
-        linearized_indices = batch_indices * (self.vocab_size + self.max_oov) + word_indices
-        value_to_add = context_attn_scores.view(-1)
-        p_copy.put_(linearized_indices, value_to_add, accumulate=True)
-        output_prob = p_gen * p_vocab + (1 - p_gen) * p_copy
-
-        return torch.log(output_prob.clamp(min=1e-10)), hidden, context_attn_scores
-
 class BaseType(nn.Module):
     '''
     submodule for handling base types
     '''
-    def __init__(self, vocab_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
+    def __init__(self, vocab_size, embed_size, hidden_size,
+                 n_layers=1, dropout_p=0.0):
         super(BaseType, self).__init__()
-        self.rnn = nn.LSTM(embed_size, hidden_size, num_layers=n_layers, dropout=dropout_p, batch_first=True)
-        #self.parent_proj = nn.Linear(hidden_size, hidden_size)
-        #self.frat_proj = nn.Linear(hidden_size, hidden_size)
-        self.attn = CopyAttn(hidden_size, hidden_size)
+        self.rnn = nn.LSTM(embed_size, hidden_size,
+                           num_layers=n_layers, dropout=dropout_p,
+                           batch_first=True)
+        self.attn = MultiAttn(embed_size, hidden_size)
+        self.copy_attn = CopyAttn(hidden_size, hidden_size)
         self.gen_prob = nn.Sequential(
                             nn.Linear(3 * hidden_size + embed_size, 1),
                             nn.Sigmoid()
                             )
         self.out = nn.Linear(hidden_size, vocab_size)
+        self.sim_matrix = nn.Linear(hidden_size, hidden_size)
         self.vocab_size = vocab_size
 
     def forward(self, input, hidden, encoder_outputs, context_info, max_oov=20):
         '''
         input should already be embedded here (done in Type module)
         '''
-        # hidden = (F.tanh(self.parent_proj(parent_hidden[0]) + self.frat_proj(frat_hidden[0])),
-        #          F.tanh(self.parent_proj(parent_hidden[1]) + self.frat_proj(frat_hidden[1])))
+        if context_info:
+            input = self.attn(input,
+                              encoder_outputs,
+                              torch.cat(context_info.name_hiddens, 1),
+                              torch.cat(context_info.type_hiddens, 1)
+                              )
+        else:
+            input = self.attn(input,
+                              encoder_outputs,
+                              torch.zeros(encoder_outputs.shape).to(device),
+                              torch.zeros(encoder_outputs.shape).to(device)
+                              )
+        input = input.unsqueeze(0)
         output, hidden = self.rnn(input, hidden)
         if context_info is not None:
             cat_hidden = torch.cat((output,
@@ -228,14 +141,20 @@ class BaseType(nn.Module):
             oov_var = torch.zeros(max_oov).to(device)
             output_prob = F.softmax(self.out(output).view(-1), dim=0)
             p_vocab = torch.cat((output_prob, oov_var), 0)
-            context_attn_scores = self.attn(output, context_info.type_hiddens, score_only=True)
             p_copy = torch.zeros(self.vocab_size + max_oov).to(device)
-            p_copy = p_copy.clone()
-            p_copy.put_(context_info.type_indices, context_attn_scores.view(-1), accumulate=True)
+            last_hiddens = torch.cat([name_hs[:, -1, :] for name_hs in context_info.name_hiddens], 0)
+            sim_scores = torch.mm(encoder_outputs[:, -1, :],
+                                  last_hiddens.transpose(0, 1))
+            sim_scores = F.softmax(sim_scores, dim=1)
+            for i in range(len(context_info.name_hiddens)):
+                type_hs = context_info.type_hiddens[i]
+                type_indices = context_info.type_indices[i]
+                attn_prob = self.copy_attn(output, type_hs, score_only=True)
+                p_copy.put_(type_indices, sim_scores[:, i] * attn_prob.view(-1), accumulate=True)
+                
             prob = gen_p * p_vocab + (1 - gen_p) * p_copy
             return torch.log(prob.clamp(min=1e-10).unsqueeze(0)), hidden
         else:
-            output = self.attn(output, encoder_outputs)
             output = self.out(output.squeeze(1))
             output = F.log_softmax(output, dim=1)
             return output, hidden
@@ -246,18 +165,37 @@ class ArrowType(nn.Module):
     '''
     def __init__(self, vocab_size, embed_size, hidden_size, n_layers=1, dropout_p=0.0):
         super(ArrowType, self).__init__()
-        #self.parent_proj = nn.Linear(hidden_size, hidden_size)
-        #self.frat_proj = nn.Linear(hidden_size, hidden_size)
-        self.attn = Attn(embed_size, hidden_size, output_size=embed_size)
+        self.attn = MultiAttn(embed_size, hidden_size)
         self.rnn = nn.LSTM(embed_size, hidden_size, num_layers=n_layers, dropout=dropout_p, batch_first=True)
         self.out = nn.Linear(hidden_size, vocab_size)
 
-    def forward(self, input, hidden, encoder_outputs):
-        # hidden = (F.tanh(self.parent_proj(parent_hidden[0]) + self.frat_proj(frat_hidden[0])),
-        #          F.tanh(self.parent_proj(parent_hidden[1]) + self.frat_proj(frat_hidden[1])))
-        input = self.attn(input, encoder_outputs).unsqueeze(0)
+    def forward(self, input, hidden, *args):
+        input = self.attn(input, *args).unsqueeze(0)
         output, hidden = self.rnn(input, hidden)
         return hidden
+
+class MultiAttn(nn.Module):
+    '''
+    attention from multiple sources
+    '''
+    def __init__(self, input_size, hidden_size, source_num=3):
+        super().__init__()
+        self.attn = nn.Linear(input_size, hidden_size)
+        self.attn_combine = nn.Linear(source_num * hidden_size + input_size, input_size)
+        self.source_num = source_num
+
+    def forward(self, input, *args):
+        assert(self.source_num == len(args))
+        transformed_input = self.attn(input)
+        context_vectors = []
+        for arg in args:
+            attn_scores = torch.bmm(arg, transformed_input.transpose(1, 2))
+            attn_scores = F.softmax(attn_scores, dim=1).transpose(1, 2)
+            context = torch.bmm(attn_scores, arg).squeeze(1)
+            context_vectors.append(context)
+        combined_hiddens = [input.view(1, -1)] + context_vectors
+        output = F.tanh(self.attn_combine(torch.cat(combined_hiddens, 1)))
+        return output
 
 class CopyAttn(nn.Module):
     '''
@@ -294,7 +232,7 @@ class Type(nn.Module):
                  vocab_size, embed_size, hidden_size,
                  kind_dict, topo_loss_factor=1,
                  n_layers=1, dropout_p=0.0, weight=None,
-                 max_oov=20):
+                 max_oov=20, embedding=None):
         super(Type, self).__init__()
         self.num_modules = 2
         self.module_selector = nn.Sequential(
@@ -303,10 +241,16 @@ class Type(nn.Module):
                                     nn.Linear(hidden_size, self.num_modules),
                                     nn.LogSoftmax(dim=0)
                                    )
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.base_module = BaseType(vocab_size, embed_size, hidden_size)
-        self.left_arrow_module = ArrowType(vocab_size, embed_size, hidden_size)
-        self.right_arrow_module = ArrowType(vocab_size, embed_size, hidden_size)
+        if embedding is None:
+            self.embedding = nn.Embedding(vocab_size, embed_size)
+        else:
+            self.embedding = embedding
+        self.base_module = BaseType(vocab_size, embed_size, hidden_size,
+                                    n_layers=n_layers, dropout_p=dropout_p)
+        self.left_arrow_module = ArrowType(vocab_size, embed_size, hidden_size,
+                                           n_layers=n_layers, dropout_p=dropout_p)
+        self.right_arrow_module = ArrowType(vocab_size, embed_size, hidden_size,
+                                            n_layers=n_layers, dropout_p=dropout_p)
         self.context_attn = CopyAttn(hidden_size, hidden_size)
         self.hidden_combiner = Combiner(hidden_size, hidden_num=2)
         self.kind_dict = kind_dict
@@ -371,6 +315,8 @@ class Type(nn.Module):
                     kind = self.kind_dict[token]
                 else:
                     kind = context_info.oov_kind_dict[token]
+                if rec_depth == 0:
+                    assert (kind == 0)
             results = [data_constructor.data[0][0].item()]
             for i in range(kind):
                 if token >= self.vocab_size:
@@ -399,15 +345,30 @@ class Type(nn.Module):
                 return results[0], hidden
             return Tree.singleton(results), hidden
         else:
-            left_hidden = self.left_arrow_module(embed, hidden, encoder_outputs)
-            #right_hidden = self.right_arrow_module(embed, hidden, encoder_outputs)
+            if context_info:
+                name_hiddens = torch.cat(context_info.name_hiddens, 1)
+                type_hiddens = torch.cat(context_info.type_hiddens, 1)
+            else:
+                name_hiddens = torch.zeros(encoder_outputs.shape).to(device)
+                type_hiddens = torch.zeros(encoder_outputs.shape).to(device)
+            left_hidden = self.left_arrow_module(embed, hidden,
+                                                 encoder_outputs,
+                                                 name_hiddens,
+                                                 type_hiddens)
+            #hidden = self.hidden_combiner(left_hidden, hidden)
+            '''
+            right_hidden = self.right_arrow_module(embed, hidden,
+                                                   encoder_outputs,
+                                                   name_hiddens,
+                                                   type_hiddens)
+            '''
             arrow_tensor = singleton_variable(arrow_token, batch_size).to(device)
             if is_train:
                 left_loss, _, left_hidden = self(arrow_tensor, left_hidden, encoder_outputs, context_info, is_train, reference.left)
                 right_hidden = self.hidden_combiner(left_hidden, hidden)
                 right_loss, _, hidden = self(arrow_tensor, right_hidden, encoder_outputs, context_info, is_train, reference.right)
                 loss += left_loss + right_loss
-                return loss, reference.get_last(), hidden
+                return loss, reference.right.get_last(), hidden
             else:
                 left_result, left_hidden = self(arrow_tensor, left_hidden, encoder_outputs, context_info, rec_depth=rec_depth-1)
                 right_hidden = self.hidden_combiner(left_hidden, hidden)
@@ -417,15 +378,20 @@ class Type(nn.Module):
 class ContextType(nn.Module):
 
     def __init__(self, vocab_size, embed_size, hidden_size,
-                 kind_dict, n_layers=1, dropout_p=0.0):
+                 kind_dict, n_layers=1, dropout_p=0.0,
+                 embedding=None):
         super().__init__()
         self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(vocab_size, embed_size)
+        if embedding is None:
+            self.embedding = nn.Embedding(vocab_size, embed_size)
+        else:
+            self.embedding = embedding
         self.rnn = nn.LSTM(embed_size, hidden_size,
                            num_layers=n_layers, dropout=dropout_p,
                            batch_first=True)
         self.vocab_size = vocab_size
 
+    '''
     def forward_(self, input, hidden, hiddens):
         if type(input.node) is int:
             embedded = self.embedding(singleton_variable(input.node, 0).to(device))
@@ -450,20 +416,33 @@ class ContextType(nn.Module):
 
 
     def forward(self, input):
-        '''
+
+    
         input is the tree of indices for a type
-        '''
+    
         hidden = self.initHidden()
         # node_map = input.traversal()
         # node_num = len(node_map)
         hiddens, last_hidden = self.forward_(input, hidden, [])
         return hiddens, last_hidden
+    '''
 
     def initHidden(self):
         hidden = (torch.zeros(1, 1, self.hidden_size).to(device),
                   torch.zeros(1, 1, self.hidden_size).to(device)
                   )
         return hidden
+
+    def forward(self, input):
+        indices = list(input.traversal().values())
+        nonarrow_indices = [x for x in range(len(indices)) if indices[x] != arrow_token]
+        input_var = torch.LongTensor(indices).to(device)
+        input_len = len(indices)
+        embedded = self.embedding(input_var).view(1, input_len, -1)
+        hidden = self.initHidden()
+        output, hidden = self.rnn(embedded, hidden)
+        output = output[:, nonarrow_indices, :]
+        return output, hidden
 
 class Combiner(nn.Module):
 
@@ -491,12 +470,13 @@ class ContextInfo():
     a class for holding relevant context info to pass to decoder
     '''
 
-    def __init__(self, name_hidden, type_hiddens, type_hidden, type_indices, oov_kind_dict):
-        assert(len(type_hiddens) == len(type_indices))
+    def __init__(self, name_hidden, name_hiddens, type_hidden, type_hiddens, type_indices, oov_kind_dict):
         self.name_hidden = name_hidden
-        self.type_hiddens = torch.cat(type_hiddens, 1)
+        self.name_hiddens = name_hiddens  #torch.cat(name_hiddens, 1)
+        self.type_hiddens = type_hiddens  #torch.cat(type_hiddens, 1)
         self.type_hidden = type_hidden
-        self.type_indices = torch.tensor(type_indices, dtype=torch.long).to(device)
+        self.type_indices = type_indices
+        #torch.tensor(type_indices, dtype=torch.long).to(device)
         self.oov_kind_dict = oov_kind_dict
 
 class Model(nn.Module):
@@ -511,15 +491,25 @@ class Model(nn.Module):
                  weight=None):
         super(Model, self).__init__()
         self.hidden_size = hidden_size
+        self.input_embedding = nn.Embedding(input_vocab_size, embed_size)
+        self.output_embedding = nn.Embedding(target_vocab_size, embed_size)
         self.encoder = Encoder(input_vocab_size, embed_size, hidden_size,
+                               embedding=self.input_embedding,
                                n_layers=n_layers, dropout_p=dropout_p)
         self.decoder = Type(target_vocab_size, embed_size, hidden_size,
-                            kind_dict, n_layers, dropout_p, weight=weight)
+                            kind_dict, embedding=self.output_embedding,
+                            n_layers=n_layers, dropout_p=dropout_p,
+                            weight=weight)
         self.context_type_encoder = ContextType(target_vocab_size, embed_size,
                                                 hidden_size, kind_dict,
-                                                n_layers, dropout_p)
+                                                embedding=self.output_embedding,
+                                                n_layers=n_layers,
+                                                dropout_p=dropout_p)
         self.context_name_encoder = Encoder(input_vocab_size, embed_size,
-                                            hidden_size, n_layers, dropout_p)
+                                            hidden_size,
+                                            embedding=self.input_embedding,
+                                            n_layers=n_layers,
+                                            dropout_p=dropout_p)
         self.combiner = Combiner(hidden_size)
         self.rec_depth = rec_depth
 
@@ -539,26 +529,33 @@ class Model(nn.Module):
         if context_info is not None:
             context_num = context_info.num
 
-            # process context names
-            context_name_hidden = self.context_name_encoder.initHidden(context_num)
-            context_name_encoder_outputs, context_name_hidden = self.context_name_encoder(context_info.names, context_info.name_lengths, context_name_hidden)
-            context_name_hidden = (context_name_hidden[0].view(context_num, 1, -1),
-                                   context_name_hidden[1].view(context_num, 1, -1))
-            context_name_hidden = ((context_name_hidden[0].sum(dim=0)/context_num).unsqueeze(0),
-                                   (context_name_hidden[1].sum(dim=0)/context_num).unsqueeze(0))
+            # process context names]
+            context_name_hiddens = []
+            context_name_last_hiddens = []
+            for name in context_info.names:
+                name_hidden = self.context_name_encoder.initHidden(1)
+                name_len = name.size(0)
+                name_outputs, name_hidden = self.context_name_encoder(name.view(1, name_len, -1), [name_len], name_hidden)
+                context_name_hiddens.append(name_outputs)
+                name_hidden = (name_hidden[0].view(1, 1, -1),
+                               name_hidden[1].view(1, 1, -1))
+                context_name_last_hiddens.append(name_hidden)
+            context_name_hidden = (sum([x[0] for x in context_name_last_hiddens])/context_num,
+                                   sum([x[1] for x in context_name_last_hiddens])/context_num)
 
             # process context types
             context_type_hiddens = []
             context_type_last_hiddens = []
             for tree in context_info.sigs:
                 type_hiddens, type_hidden = self.context_type_encoder(tree)
-                context_type_hiddens += type_hiddens
+                context_type_hiddens.append(type_hiddens)
                 context_type_last_hiddens.append(type_hidden)
             context_type_hidden = (sum([x[0] for x in context_type_last_hiddens])/context_num,
                                    sum([x[1] for x in context_type_last_hiddens])/context_num)
 
-            context_info = ContextInfo(context_name_hidden, context_type_hiddens,
-                                       context_type_hidden, context_info.indices,
+            context_info = ContextInfo(context_name_hidden, context_name_hiddens,
+                                       context_type_hidden, context_type_hiddens,
+                                       context_info.indices,
                                        context_info.oov_kind_dict)
             hidden = self.combiner(hidden, context_name_hidden, context_type_hidden)
         decoder_in = torch.full((batch_size, 1), start_token, dtype=torch.long).to(device)
