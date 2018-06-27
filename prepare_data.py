@@ -107,11 +107,12 @@ def readSigTokens(filename):
 
 # takes the input line and returns the file number, the function name, and the corresponding signature
 def processLine(line):
-    [num, annot] = line.split('\t')
-    [input_name, sig] = annot.split('::', 1)
-    input_name = input_name.strip()
-    sig = sig.strip()
-    return int(num), input_name, sig
+    [num, path, name_and_sig] = line.split('\t')
+    [name, rest] = name_and_sig.split(None, 1)
+    [colon, sig] = rest.split(None, 1)
+    assert(colon == "::")
+
+    return int(num), name.strip(), sig.strip()
 
 # processes plain data that only consist of function names and signatures
 def prepareData(filename, use_context=False, num_context_sig=3):
@@ -121,14 +122,19 @@ def prepareData(filename, use_context=False, num_context_sig=3):
     output_lang = Lang(False)
     data = []
     if use_context:
+        context_names = []
         context_sigs = []
         for line in lines:
             num, input_name, sig = processLine(line)
+            name = [input_name]
             cur_context = context_sigs[-num_context_sig:]
-            sigs = [ p[1] for p in cur_context if p[0] == num]
-            triple = ([input_name], sig, [sigs])
-            data.append(triple)
+            cur_name_context = context_names[-num_context_sig:]
+            sigs = [p[1] for p in cur_context if p[0] == num]
+            names = [p[1] for p in cur_name_context if p[0] == num]
+            datum = (name, sig, names, sigs)
+            data.append(datum)
             context_sigs.append([num, sig])
+            context_names.append([num, name])
             input_lang.add_name(input_name)
             output_lang.add_sig(sig)
     else:
@@ -185,5 +191,5 @@ def prepareDataWithFileName(filename, full_path=False, use_context=False, num_co
                 input_lang.add_name(ident)
             output_lang.add_sig(sig)
             data.append((name, sig))
-    #random.shuffle(data)
+    random.shuffle(data)
     return input_lang, output_lang, data
