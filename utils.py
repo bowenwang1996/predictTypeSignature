@@ -26,6 +26,20 @@ def timeSince(since):
 def pad_to_len(batch, l):
     return list(map(lambda x: x + (l - len(x)) * [0], batch))
 
+def pad_nested_to_len(target_batch, l):
+    # in place operation
+    
+    max_len = 0
+    for indices in target_batch:
+        for elem in indices:
+            if max_len < len(elem):
+                max_len = len(elem)
+
+    for indices in target_batch:
+        for elem in indices:
+            elem += (max_len - len(elem)) * [0]
+        indices += (l - len(indices)) * [max_len * [0]]
+
 def process_sig(sig):
     new_sig = ""
     for token in sig.split():

@@ -1,6 +1,8 @@
 import identifier_segmentor
 from type_signatures import UNPARSE_ARROW
 import random
+import string
+import copy
 
 SPECIAL_SYMBOLS = ["(", ")", "[", "]", ",", UNPARSE_ARROW, ":->", "<-->"]
 start_token = 0
@@ -64,19 +66,80 @@ class Lang:
         self.idx_to_token = idx_dict
         self.token_to_idx = token_dict
 
-def readSigTokens(filename):
-    with open(filename, 'r') as f:
-        tokens = f.read().split('\n')
-    lang = Lang(False)
-    for token in tokens:
-        # if it is a typename, we only need the unqualified part
-        if token[0].isalpha():
-            lang.add_token(token.split('.')[-1])
-        elif not token[0].isalpha():
-            lang.add_token(token)
-    for token in SPECIAL_SYMBOLS:
-        lang.add_token(token)
-    return lang
+class TargetLang:
+    
+    def __init__(self):
+        self.token_to_idx = {"<": 0, ">": 1}
+        self.token_to_count = {"<": 1, ">": 1}
+        self.idx_to_token = {0: "<", 1: ">"}
+        self.n_word = 2
+        self.type_to_idx = {"<": 0, ">": 1, "<UNK>": 2}
+        self.idx_to_type = {0: "<", 1: ">", 2:"<UNK>"}
+        self.n_type = 3
+        self.type_to_tokens = {}
+        for c in string.printable:
+            if not c.isupper():
+                self.add_token(c)
+        self.add_type_tokens("<")
+        self.add_type_tokens(">")
+        self.add_type_tokens("<UNK>")
+        
+    def add_token(self, token):
+        if token not in self.token_to_idx:
+            self.token_to_idx[token] = self.n_word
+            self.idx_to_token[self.n_word] = token
+            self.n_word += 1
+            self.token_to_count[token] = 1
+        else:
+            self.token_to_count[token] += 1
+
+    def add_type(self, t):
+        if t not in self.type_to_idx:
+            self.type_to_idx[t] = self.n_type
+            self.idx_to_type[self.n_type] = t
+            self.n_type += 1
+
+    def add_sig(self, sig):
+        for token in sig.split():
+            if token[0].isupper():
+                token = token.split('.')[-1]
+            self.add_type(token)
+            for ident in identifier_segmentor.segment(token):
+                self.add_token(ident)
+
+    def compute_embed_idx(self, token):
+        token = token.lower()
+        indices = []
+        for substr in self.token_to_idx:
+            count = token.count(substr)
+            indices += count * [self.token_to_idx[substr] + 1] # +1 for padding
+        return indices
+    
+    def add_type_tokens(self, sig):
+        for token in sig.split():
+            if token[0].isupper():
+                token = token.split('.')[-1]
+            if token not in self.type_to_tokens:
+                self.type_to_tokens[token] = self.compute_embed_idx(token)
+                
+    # remove tokens that have frequency below a certain threshold
+    def trim_tokens(self, threshold=5):
+        for token in list(self.token_to_count.keys()):
+            if self.token_to_count[token] < threshold\
+              and self.token_to_idx[token] > 2:
+                self.idx_to_token.pop(self.token_to_idx[token])
+                self.token_to_idx.pop(token)
+                self.token_to_count.pop(token)
+                self.n_word -= 1
+        idx_dict = {}
+        for idx, key in enumerate(self.idx_to_token.keys()):
+            idx_dict[idx] = self.idx_to_token[key]
+        token_dict = {}
+        for idx in idx_dict:
+            token_dict[idx_dict[idx]] = idx
+        self.idx_to_token = idx_dict
+        self.token_to_idx = token_dict
+
 
 # takes the input line and returns the file number, the function name, and the corresponding signature
 def processLine(line):
@@ -91,7 +154,7 @@ def prepareData(filename, use_context=False, num_context_sig=3):
     with open(filename, 'r') as f:
         lines = filter(lambda l: len(l) > 0, f.read().split('\n'))
     input_lang = Lang(True)
-    output_lang = Lang(False)
+    output_lang = TargetLang()
     data = []
     if use_context:
         context_sigs = []
@@ -130,24 +193,22 @@ def prepareDataWithFileName(filename, full_path=False, use_context=False, num_co
     with open(filename, 'r') as f:
         lines = filter(lambda l: len(l) > 0, f.read().split('\n'))
     input_lang = Lang(True)
-    output_lang = Lang(False)
+    output_lang = TargetLang()
     data = []
     if use_context:
         context_sigs = []
-        context_names = []
         for line in lines:
             num, fname, dir_name, input_name, sig = processLineWithFileName(line, full_path)
             cur_context = context_sigs[-num_context_sig:]
-            cur_name_context = context_names[-num_context_sig:]
-            sigs = [p[2] for p in cur_context if p[0] == num]
-            names = [p[2] for p in cur_name_context if p[0] == num]
+            sigs = [ p[2] for p in cur_context if p[0] == num or p[1] == dir_name]
             name = fname + [input_name]
-            data.append((name, sig, names, sigs))
+            data.append((name, sig, sigs))
             context_sigs.append([num, dir_name, sig])
-            context_names.append([num, dir_name, name])
             for ident in name:
                 input_lang.add_name(ident)
             output_lang.add_sig(sig)
+        for _, sig, _ in data:
+            output_lang.add_type_tokens(sig)
     else:
         for line in lines:
             _, fname, input_name, sig = processLineWithFileName(line, full_path)
@@ -157,5 +218,7 @@ def prepareDataWithFileName(filename, full_path=False, use_context=False, num_co
             output_lang.add_sig(sig)
             # this is somewhat hacky. Might need to write a class just for name
             data.append((name, sig))
+        for _, sig in data:
+            output_lang.add_type_tokens(sig)
     random.shuffle(data)
     return input_lang, output_lang, data
