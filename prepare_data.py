@@ -160,7 +160,7 @@ def processLineWithFileName(line, full_path=False):
     return int(num), filename, dir_name, name.strip(), sig.strip()
 
 # processes data with qualified name (full path to the file) and signatures
-def prepareDataWithFileName(filename, full_path=False, use_context=False, num_context_sig=3):
+def prepareDataWithFileName(filename, full_path=False, use_context=False, num_context_sig=3, shuffle=True):
     with open(filename, 'r') as f:
         lines = filter(lambda l: len(l) > 0, f.read().split('\n'))
     input_lang = Lang(True)
@@ -191,5 +191,6 @@ def prepareDataWithFileName(filename, full_path=False, use_context=False, num_co
                 input_lang.add_name(ident)
             output_lang.add_sig(sig)
             data.append((name, sig))
-    random.shuffle(data)
+    if shuffle:
+        random.shuffle(data)
     return input_lang, output_lang, data

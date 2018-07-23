@@ -617,7 +617,10 @@ class Tree():
     @classmethod
     def singleton(cls, node):
         res = Tree("")
-        res.node = node
+        if type(node) is list and len(node) == 1:
+          res.node = node[0]
+        else:
+          res.node = node
         return res
 
     @classmethod
@@ -802,6 +805,21 @@ class Tree():
             other_copy.strip()
             return self_copy == other_copy
         return False
+
+    def depth(self):
+      left_depth = 0
+      right_depth = 0
+      if self.left is not None:
+        left_depth = self.left.depth()
+      if self.right is not None:
+        right_depth = self.right.depth()
+      cur_depth = 1
+      if type(self.node) is list:
+        for item in self.node:
+          if isinstance(item, self.__class__):
+            cur_depth = max(cur_depth, item.depth())
+      return cur_depth + max(left_depth, right_depth)
+
 
 '''
 sig = "Maybe M.Int"

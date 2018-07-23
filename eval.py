@@ -5,7 +5,6 @@ from model import Model
 from prepare_data import prepareDataWithFileName
 from train import eval_test
 
-import gc
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 parser = argparse.ArgumentParser()
@@ -26,10 +25,11 @@ parser.add_argument("--rec_depth", default=6, type=int)
 parser.add_argument("--embed_size", default=128, type=int)
 parser.add_argument("--hidden_size", default=256, type=int)
 parser.add_argument("--model_state_file", default="model_state.pth")
+parser.add_argument("--out_file", default="results/structured_test_output")
 
 def main(arg):
-    input_lang, output_lang, train_data = prepareDataWithFileName(arg.train_data, use_context = True)
-    _, _, test_data = prepareDataWithFileName(arg.test_data, use_context=True)
+    input_lang, output_lang, train_data = prepareDataWithFileName(arg.train_data, use_context = True, shuffle=False)
+    _, _, test_data = prepareDataWithFileName(arg.test_data, use_context=True, shuffle=False)
 
     model = Model(input_lang.n_word, output_lang.n_word, arg.embed_size,
                   arg.hidden_size, output_lang.kind_dict, dropout_p=arg.dropout,
@@ -38,8 +38,8 @@ def main(arg):
     model = model.to(device)
     model.load_state_dict(torch.load(arg.model_state_file))
     print("load model")
-    accuracy, structural_acc = eval_test(test_data, input_lang, output_lang, model)
-    
+    accuracy, structural_acc = eval_test(test_data, input_lang, output_lang, model,
+                                         out_file=arg.out_file, dict_out=arg.out_file + "_dict")   
     print("test accuracy: {:.4f} structural acc: {:.4f}".format(accuracy, structural_acc))
     
 if __name__ == "__main__":

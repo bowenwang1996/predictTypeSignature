@@ -153,14 +153,12 @@ def train(data, model, optimizer,
     print("epoch total training time: {}".format(timeSince(start)))
     return epoch_loss
 
-def eval(data, input_vocab, output_vocab, model, is_test=False, write_output=False):
+def eval(data, input_vocab, output_vocab, model, is_test=False, out_file=None, dict_out=None):
     model.eval()
     num_correct = 0
     num_structural_correct = 0
     eval_loss = 0
-    if write_output:
-        dev_output = "results/dev_output"
-        subprocess.call("rm {}".format(dev_output), shell=True)
+    depth_dict = {}
     for name, sig, context_names, context_sigs in data:
         input_variable = variableFromName(name, input_vocab)
         input_len = input_variable.size(1)
@@ -180,25 +178,36 @@ def eval(data, input_vocab, output_vocab, model, is_test=False, write_output=Fal
             gen_result.to_str(output_vocab.idx_to_token, oov_dict=context_info.oov_idx_to_token)
         else:
             gen_result.to_str(output_vocab.idx_to_token)
+        #predict_sig = gen_result.to_sig()
+        #predict_sig_tree = Tree.from_str(predict_sig)
         if gen_result == sig_tree:
             num_correct += 1
+            depth = sig_tree.depth()
+            if depth in depth_dict:
+                depth_dict[depth] += 1
+            else:
+                depth_dict[depth] = 1
         if gen_result.structural_eq(sig_tree):
             num_structural_correct += 1
-        if write_output:
-            with open(dev_output, "a+") as f:
+        if out_file is not None:
+            with open(out_file, "a+") as f:
                 if context_info is not None:
                     for context_name, context_sig in zip(context_names, context_sigs):
                         f.write("name: {} sig: {}\n".format(context_name, context_sig))
-                        f.write("name: {}\n".format(name))
-                        f.write("sig: {}\n".format(sig))
-                        f.write("prediction: {}\n".format(gen_result.to_sig()))
-                        f.write("\n")
+                f.write("name: {}\n".format(name))
+                f.write("sig: {}\n".format(process_sig(sig)))
+                f.write("prediction: {}\n".format(gen_result.to_sig()))
+                f.write("\n")
+    if dict_out is not None:
+        with open(dict_out, "w+") as f:
+            f.write("{}\n".format(depth_dict))
     if not is_test:
         return eval_loss/len(data), float(num_correct)/len(data), float(num_structural_correct)/len(data)
     return float(num_correct)/len(data), float(num_structural_correct)/len(data)
 
-def eval_test(data, input_lang, output_lang, model):
-    return eval(data, input_lang, output_lang, model, is_test=True)
+def eval_test(data, input_lang, output_lang, model, out_file=None, dict_out=None):
+    return eval(data, input_lang, output_lang, model,
+                is_test=True, out_file=out_file, dict_out=dict_out)
 
 # data should be in original format (i.e. string)
 def randomEval(data, model, input_lang, output_lang):

@@ -105,6 +105,9 @@ class BaseType(nn.Module):
                            num_layers=n_layers, dropout=dropout_p,
                            batch_first=True)
         self.attn = MultiAttn(embed_size, hidden_size)
+        #self.sig_attn = Attn(hidden_size, hidden_size)
+        #self.name_attn = Attn(hidden_size, hidden_size)
+        #self.input_attn = Attn(hidden_size, hidden_size)
         self.copy_attn = CopyAttn(hidden_size, hidden_size)
         self.gen_prob = nn.Sequential(
                             nn.Linear(3 * hidden_size + embed_size, 1),
@@ -133,10 +136,13 @@ class BaseType(nn.Module):
         input = input.unsqueeze(0)
         output, hidden = self.rnn(input, hidden)
         if context_info is not None:
+            #name_context = self.name_attn(output, torch.cat(context_info.name_hiddens, 1))
+            #sig_context = self.sig_attn(output, torch.cat(context_info.type_hiddens, 1))
+            #input_context = self.input_attn(output, encoder_outputs)
             cat_hidden = torch.cat((output,
-                                   context_info.name_hidden[0],
-                                   context_info.type_hidden[0],
-                                   input), 2)
+                                    context_info.name_hidden[0],
+                                    context_info.type_hidden[0],
+                                    input), 2)
             gen_p = self.gen_prob(cat_hidden).view(-1)
             oov_var = torch.zeros(max_oov).to(device)
             output_prob = F.softmax(self.out(output).view(-1), dim=0)
